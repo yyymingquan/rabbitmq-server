@@ -416,6 +416,20 @@ processor_args(Configuration, Sock) ->
      ssl_login_name(RealSocket, Configuration), PeerAddr}.
 
 adapter_info(Sock) ->
+case rabbit_net:socket_ends(Socket, inbound) of
+        {ok, {PeerIp, PeerPort, Ip, Port}} ->
+#amqp_adapter_info{protocol        = {'STOMP', 0},
+                       name            = Name,
+                       host            = Host,
+                       port            = Port,
+                       peer_host       = PeerHost,
+                       peer_port       = PeerPort,
+                       additional_info = maybe_ssl_info(Sock)}
+            process_connect(ConnectPacket, Socket, ConnName, SendFun, SocketEnds);
+        {error, Reason} ->
+            {error, {socket_ends, Reason}}
+    end.
+
     amqp_connection:socket_adapter_info(Sock, {'STOMP', 0}).
 
 ssl_login_name(_Sock, #stomp_configuration{ssl_cert_login = false}) ->
