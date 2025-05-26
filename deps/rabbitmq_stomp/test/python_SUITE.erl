@@ -32,7 +32,7 @@ groups() ->
 
 init_per_suite(Config) ->
     {ok, _} = rabbit_ct_helpers:exec(["pip", "install", "-r", requirements_path(Config),
-                                                        "--target", deps_path(Config)]),
+                                                            "--target", deps_path(Config)]),
     Config.
 
 end_per_suite(Config) ->
