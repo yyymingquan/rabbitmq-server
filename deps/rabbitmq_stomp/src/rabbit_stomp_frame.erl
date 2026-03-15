@@ -90,7 +90,9 @@ initial_state(Config) -> {none, Config}.
 %% Allow some headroom for unknown commands but bound memory usage.
 -define(MAX_COMMAND_LENGTH, 32).
 
-%% Parser state
+%% Parser state.
+%% acc is only used for header values with escape sequences.
+%% Commands and headers without escapes use sub-binary extraction.
 -record(ps, {acc     = [] :: [byte()],
              acc_len = 0  :: non_neg_integer(),
              cmd          :: atom() | binary() | undefined,
@@ -103,109 +105,231 @@ initial_state(Config) -> {none, Config}.
 %%
 
 parse(Content, {resume, Continuation}) -> Continuation(Content);
-parse(Content, {none, Config})         -> parser(Content, noise, #ps{config = Config}).
+parse(Content, {none, Config})         -> parse_noise(Content, #ps{config = Config}).
 
 %%
-%% Incremental state machine parser
+%% Phase: noise — skip NULs and LFs between frames
 %%
-%% Phases: noise | command | headers | hdrname | hdrvalue
-%% Body parsing is handled separately by parse_body/2.
+
+parse_noise(<<>>, S) ->
+    more(fun(Rest) -> parse_noise(Rest, S) end);
+parse_noise(<<?NUL, Rest/binary>>, S) -> parse_noise(Rest, S);
+parse_noise(<<?LF,  Rest/binary>>, S) -> parse_noise(Rest, S);
+parse_noise(<<?CR, ?LF, Rest/binary>>, S) -> parse_noise(Rest, S);
+parse_noise(<<?CR>>, S) -> more(fun(Rest) -> parse_noise(<<?CR, Rest/binary>>, S) end);
+parse_noise(<<?CR, Ch:8, _/binary>>, _S) -> {error, {unexpected_chars_between_frames, [?CR, Ch]}};
+parse_noise(Bin, S) -> parse_command(Bin, S).
+
+%%
+%% Phase: command — scan for LF, extract as sub-binary
+%%
+
+parse_command(Bin, S) ->
+    case scan_until_lf(Bin) of
+        {ok, CmdBin, Rest} ->
+            case byte_size(CmdBin) > ?MAX_COMMAND_LENGTH of
+                true  -> {error, {command_too_long, ?MAX_COMMAND_LENGTH}};
+                false ->
+                    Cmd = maps:get(CmdBin, ?KNOWN_COMMANDS, CmdBin),
+                    parse_headers(Rest, S#ps{cmd = Cmd, hdrs = []})
+            end;
+        {more, Len} ->
+            case Len > ?MAX_COMMAND_LENGTH of
+                true  -> {error, {command_too_long, ?MAX_COMMAND_LENGTH}};
+                false -> more(fun(Rest) -> parse_command(<<Bin/binary, Rest/binary>>, S) end)
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%%
+%% Phase: headers — dispatch to hdrname or body
+%%
+
+parse_headers(<<?LF, Rest/binary>>, S) ->
+    parse_body(Rest, S);
+parse_headers(<<?CR, ?LF, Rest/binary>>, S) ->
+    parse_body(Rest, S);
+parse_headers(<<>>, S) ->
+    more(fun(Rest) -> parse_headers(Rest, S) end);
+parse_headers(<<?CR>>, S) ->
+    more(fun(Rest) -> parse_headers(<<?CR, Rest/binary>>, S) end);
+parse_headers(Bin, S = #ps{hdrs = Headers,
+                           config = #stomp_parser_config{max_headers = MaxHeaders}}) ->
+    case length(Headers) >= MaxHeaders of
+        true  -> {error, {max_headers, MaxHeaders}};
+        false -> parse_hdr(Bin, S)
+    end.
+
+%%
+%% Phase: header line — scan for COLON and LF in bulk.
+%% Fast path: no escapes or CR in the header line.
+%% Slow path: escape sequences present, fall back to byte-by-byte.
+%%
+
+parse_hdr(Bin, S = #ps{config = #stomp_parser_config{max_header_length = MaxHL}}) ->
+    case scan_header_line(Bin) of
+        {ok, Name, Value, Rest} ->
+            case byte_size(Name) > MaxHL orelse byte_size(Value) > MaxHL of
+                true  -> {error, {max_header_length, MaxHL}};
+                false ->
+                    Hdrs = insert_header(S#ps.hdrs,
+                                         binary_to_list(Name),
+                                         binary_to_list(Value)),
+                    parse_headers(Rest, S#ps{hdrs = Hdrs})
+            end;
+        has_escapes ->
+            parse_hdrname_esc(Bin, S#ps{acc = [], acc_len = 0});
+        {no_value, Name} ->
+            {error, {header_no_value, binary_to_list(Name)}};
+        {more, Len} ->
+            case Len > MaxHL of
+                true  -> {error, {max_header_length, MaxHL}};
+                false -> more(fun(Rest) -> parse_hdr(<<Bin/binary, Rest/binary>>, S) end)
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% Slow path for header names with escapes or CR
+parse_hdrname_esc(<<>>, S) ->
+    more(fun(Rest) -> parse_hdrname_esc(Rest, S) end);
+parse_hdrname_esc(<<?CR>>, S) ->
+    more(fun(Rest) -> parse_hdrname_esc(<<?CR, Rest/binary>>, S) end);
+parse_hdrname_esc(<<?CR, ?LF, _/binary>>, #ps{acc = Acc}) ->
+    {error, {header_no_value, lists:reverse(Acc)}};
+parse_hdrname_esc(<<?CR, Ch:8, _/binary>>, _) ->
+    {error, {unexpected_chars_in_header, [?CR, Ch]}};
+parse_hdrname_esc(<<?LF, _/binary>>, #ps{acc = Acc}) ->
+    {error, {header_no_value, lists:reverse(Acc)}};
+parse_hdrname_esc(<<?COLON, Rest/binary>>, S = #ps{acc = Acc}) ->
+    parse_hdrvalue_esc(Rest, S#ps{acc = [], acc_len = 0,
+                                  hdrname = lists:reverse(Acc)});
+parse_hdrname_esc(<<?BSL>>, S) ->
+    more(fun(Rest) -> parse_hdrname_esc(<<?BSL, Rest/binary>>, S) end);
+parse_hdrname_esc(<<?BSL, Ch:8, Rest/binary>>, S) ->
+    unescape(Ch, fun(Ech) -> parse_hdrname_esc(Rest, accum(Ech, S)) end);
+parse_hdrname_esc(<<Ch:8, Rest/binary>>, S = #ps{acc_len = Len,
+                                                   config = #stomp_parser_config{
+                                                               max_header_length = Max}}) ->
+    case Len >= Max of
+        true  -> {error, {max_header_length, Max}};
+        false -> parse_hdrname_esc(Rest, accum(Ch, S))
+    end.
+
+%% Slow path for header values with escapes
+parse_hdrvalue_esc(<<>>, S) ->
+    more(fun(Rest) -> parse_hdrvalue_esc(Rest, S) end);
+parse_hdrvalue_esc(<<?CR>>, S) ->
+    more(fun(Rest) -> parse_hdrvalue_esc(<<?CR, Rest/binary>>, S) end);
+parse_hdrvalue_esc(<<?CR, ?LF, Rest/binary>>, S) ->
+    finish_hdr_esc(Rest, S);
+parse_hdrvalue_esc(<<?CR, Ch:8, _/binary>>, _) ->
+    {error, {unexpected_chars_in_header, [?CR, Ch]}};
+parse_hdrvalue_esc(<<?LF, Rest/binary>>, S) ->
+    finish_hdr_esc(Rest, S);
+parse_hdrvalue_esc(<<?BSL>>, S) ->
+    more(fun(Rest) -> parse_hdrvalue_esc(<<?BSL, Rest/binary>>, S) end);
+parse_hdrvalue_esc(<<?BSL, Ch:8, Rest/binary>>, S) ->
+    unescape(Ch, fun(Ech) -> parse_hdrvalue_esc(Rest, accum(Ech, S)) end);
+parse_hdrvalue_esc(<<Ch:8, Rest/binary>>, S = #ps{acc_len = Len,
+                                                    config = #stomp_parser_config{
+                                                                max_header_length = Max}}) ->
+    case Len >= Max of
+        true  -> {error, {max_header_length, Max}};
+        false -> parse_hdrvalue_esc(Rest, accum(Ch, S))
+    end.
+
+finish_hdr_esc(Rest, #ps{acc = Acc, hdrs = Hdrs, hdrname = HdrName} = S) ->
+    Hdrs1 = insert_header(Hdrs, HdrName, lists:reverse(Acc)),
+    parse_headers(Rest, S#ps{hdrs = Hdrs1}).
+
+%%
+%% Binary scanning helpers — bulk operations, no per-byte allocation
 %%
 
 more(Continuation) -> {more, {resume, Continuation}}.
 
-%% --- Need more data ---
-parser(<<>>,                        Phase,  S) -> more(fun(Rest) -> parser(Rest, Phase, S) end);
-parser(<<?CR>>,                     Phase,  S) -> more(fun(Rest) -> parser(<<?CR, Rest/binary>>, Phase, S) end);
+%% Scan for LF in a binary. Handles CR LF normalization.
+%% Returns {ok, BeforeLF, AfterLF} | {more, CurrentLen} | {error, _}
+scan_until_lf(Bin) ->
+    scan_until_lf(Bin, 0).
 
-%% --- CR LF normalization ---
-parser(<<?CR, ?LF,   Rest/binary>>, Phase,  S) -> parser(<<?LF, Rest/binary>>, Phase, S);
-parser(<<?CR, Ch:8, _Rest/binary>>, Phase, _S) -> {error, {unexpected_chars(Phase), [?CR, Ch]}};
-
-%% --- Escape processing (header names and values only) ---
-parser(<<?BSL>>,                    Phase,  S)
-  when Phase =:= hdrname;
-       Phase =:= hdrvalue -> more(fun(Rest) -> parser(<<?BSL, Rest/binary>>, Phase, S) end);
-parser(<<?BSL, Ch:8, Rest/binary>>, Phase,  S)
-  when Phase =:= hdrname;
-       Phase =:= hdrvalue -> unescape(Ch, fun(Ech) -> parser(Rest, Phase, accum(Ech, S)) end);
-
-%% --- Noise: skip NULs and LFs between frames ---
-parser(<<?NUL, Rest/binary>>, noise, S) -> parser(Rest, noise, S);
-parser(<<?LF,  Rest/binary>>, noise, S) -> parser(Rest, noise, S);
-parser(Rest,                  noise, S) -> parser(Rest, command, S#ps{acc = [], acc_len = 0});
-
-%% --- Command: accumulate bytes until LF ---
-parser(<<?LF,        Rest/binary>>, command, S) -> goto(command, headers, Rest, S);
-parser(<<Ch:8,       Rest/binary>>, command, S = #ps{acc_len = Len}) ->
-    case Len >= ?MAX_COMMAND_LENGTH of
-        true  -> {error, {command_too_long, ?MAX_COMMAND_LENGTH}};
-        false -> parser(Rest, command, accum(Ch, S))
-    end;
-
-%% --- Headers: LF means end of headers (start body), otherwise start a header name ---
-parser(<<?LF,        Rest/binary>>, headers, S) -> goto(headers, body, Rest, S);
-parser(Rest,                        headers, S) -> goto(headers, hdrname, Rest, S);
-
-%% --- Header name: accumulate until COLON or LF ---
-parser(<<?COLON,     Rest/binary>>, hdrname, S) -> goto(hdrname, hdrvalue, Rest, S);
-parser(<<?LF,       _Rest/binary>>, hdrname, #ps{acc = Acc}) ->
-    {error, {header_no_value, lists:reverse(Acc)}};
-parser(<<Ch:8,       Rest/binary>>, hdrname, S = #ps{acc_len = Len,
-                                                      config = #stomp_parser_config{
-                                                                  max_header_length = Max}}) ->
-    case Len >= Max of
-        true  -> {error, {max_header_length, Max}};
-        false -> parser(Rest, hdrname, accum(Ch, S))
-    end;
-
-%% --- Header value: accumulate until LF ---
-parser(<<?LF,        Rest/binary>>, hdrvalue, S) -> goto(hdrvalue, headers, Rest, S);
-parser(<<Ch:8,       Rest/binary>>, hdrvalue, S = #ps{acc_len = Len,
-                                                       config = #stomp_parser_config{
-                                                                   max_header_length = Max}}) ->
-    case Len >= Max of
-        true  -> {error, {max_header_length, Max}};
-        false -> parser(Rest, hdrvalue, accum(Ch, S))
+scan_until_lf(Bin, Pos) ->
+    case Bin of
+        <<_:Pos/binary, ?LF, _/binary>> ->
+            <<Before:Pos/binary, ?LF, Rest/binary>> = Bin,
+            {ok, Before, Rest};
+        <<_:Pos/binary, ?CR, ?LF, _/binary>> ->
+            <<Before:Pos/binary, ?CR, ?LF, Rest/binary>> = Bin,
+            {ok, Before, Rest};
+        <<_:Pos/binary, ?CR>> ->
+            {more, Pos};
+        <<_:Pos/binary, ?CR, Ch:8, _/binary>> ->
+            {error, {unexpected_chars_in_command, [?CR, Ch]}};
+        <<_:Pos/binary, _:8, _/binary>> ->
+            scan_until_lf(Bin, Pos + 1);
+        <<_:Pos/binary>> ->
+            {more, Pos}
     end.
 
-%%
-%% State transitions
-%%
+%% Scan a complete header line: Name:Value\n
+%% Fast path: no backslash or CR in the line.
+%% Returns:
+%%   {ok, NameBin, ValueBin, Rest}  — fast path, no escapes
+%%   has_escapes                     — contains \ or CR, use slow path
+%%   {no_value, NameBin}            — LF before COLON
+%%   {more, Len}                    — need more data
+%%   {error, _}                     — CR not followed by LF
+scan_header_line(Bin) ->
+    scan_hdr_name(Bin, 0).
 
-goto(command, headers, Rest, S = #ps{acc = Acc}) ->
-    CmdBin = list_to_binary(lists:reverse(Acc)),
-    Cmd = maps:get(CmdBin, ?KNOWN_COMMANDS, CmdBin),
-    parser(Rest, headers, S#ps{cmd = Cmd, hdrs = []});
+scan_hdr_name(Bin, Pos) ->
+    case Bin of
+        <<_:Pos/binary, ?COLON, _/binary>> ->
+            <<Name:Pos/binary, ?COLON, Rest/binary>> = Bin,
+            scan_hdr_value(Rest, Name, 0);
+        <<_:Pos/binary, ?LF, _/binary>> ->
+            <<Name:Pos/binary, _/binary>> = Bin,
+            {no_value, Name};
+        <<_:Pos/binary, ?CR, ?LF, _/binary>> ->
+            <<Name:Pos/binary, _/binary>> = Bin,
+            {no_value, Name};
+        <<_:Pos/binary, ?BSL, _/binary>> ->
+            has_escapes;
+        <<_:Pos/binary, ?CR>> ->
+            {more, Pos};
+        <<_:Pos/binary, ?CR, Ch:8, _/binary>> ->
+            {error, {unexpected_chars_in_header, [?CR, Ch]}};
+        <<_:Pos/binary, _:8, _/binary>> ->
+            scan_hdr_name(Bin, Pos + 1);
+        <<_:Pos/binary>> ->
+            {more, Pos}
+    end.
 
-goto(headers, body, Rest, S) ->
-    parse_body(Rest, S);
-
-goto(headers, hdrname, Rest, S = #ps{hdrs = Headers,
-                                     config = #stomp_parser_config{
-                                                 max_headers = MaxHeaders}}) ->
-    case length(Headers) >= MaxHeaders of
-        true  -> {error, {max_headers, MaxHeaders}};
-        false -> parser(Rest, hdrname, S#ps{acc = [], acc_len = 0})
-    end;
-
-goto(hdrname, hdrvalue, Rest, S = #ps{acc = Acc}) ->
-    parser(Rest, hdrvalue, S#ps{acc = [], acc_len = 0,
-                                hdrname = lists:reverse(Acc)});
-
-goto(hdrvalue, headers, Rest, S = #ps{acc = Acc, hdrs = Headers, hdrname = HdrName}) ->
-    parser(Rest, headers, S#ps{hdrs = insert_header(Headers, HdrName,
-                                                    lists:reverse(Acc))}).
+scan_hdr_value(Bin, Name, Pos) ->
+    case Bin of
+        <<_:Pos/binary, ?LF, _/binary>> ->
+            <<Value:Pos/binary, ?LF, Rest/binary>> = Bin,
+            {ok, Name, Value, Rest};
+        <<_:Pos/binary, ?CR, ?LF, _/binary>> ->
+            <<Value:Pos/binary, ?CR, ?LF, Rest/binary>> = Bin,
+            {ok, Name, Value, Rest};
+        <<_:Pos/binary, ?BSL, _/binary>> ->
+            has_escapes;
+        <<_:Pos/binary, ?CR>> ->
+            {more, Pos};
+        <<_:Pos/binary, ?CR, Ch:8, _/binary>> ->
+            {error, {unexpected_chars_in_header, [?CR, Ch]}};
+        <<_:Pos/binary, _:8, _/binary>> ->
+            scan_hdr_value(Bin, Name, Pos + 1);
+        <<_:Pos/binary>> ->
+            {more, Pos}
+    end.
 
 %%
 %% Helpers
 %%
-
-unexpected_chars(noise)    -> unexpected_chars_between_frames;
-unexpected_chars(command)  -> unexpected_chars_in_command;
-unexpected_chars(hdrname)  -> unexpected_chars_in_header;
-unexpected_chars(hdrvalue) -> unexpected_chars_in_header;
-unexpected_chars(_)        -> unexpected_chars.
 
 accum(Ch, S = #ps{acc = Acc, acc_len = Len}) ->
     S#ps{acc = [Ch | Acc], acc_len = Len + 1}.
