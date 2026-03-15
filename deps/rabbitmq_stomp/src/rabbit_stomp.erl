@@ -32,7 +32,7 @@
 start(normal, []) ->
     Config = parse_configuration(),
     Listeners = parse_listener_configuration(),
-    rabbit_global_counters:init([{protocol, stomp}]),
+    init_global_counters(),
     Result = rabbit_stomp_sup:start_link(Listeners, Config),
     EMPid = case rabbit_event:start_link() of
               {ok, Pid}                       -> Pid;
@@ -80,9 +80,9 @@ parse_configuration() ->
     {ok, ImplicitConnect} = application:get_env(implicit_connect),
     Conf = Conf0#stomp_configuration{ssl_cert_login   = SSLLogin,
                                      implicit_connect = ImplicitConnect,
-                                     max_headers = application:get_env(max_headers, ?DEFAULT_CONFIGURATION#stomp_configuration.max_headers),
-                                     max_header_length = application:get_env(max_header_length, ?DEFAULT_CONFIGURATION#stomp_configuration.max_header_length),
-                                     max_body_length = application:get_env(max_body_length, ?DEFAULT_CONFIGURATION#stomp_configuration.max_body_length)},
+                                     max_headers = application:get_env(rabbitmq_stomp, max_headers, ?DEFAULT_CONFIGURATION#stomp_configuration.max_headers),
+                                     max_header_length = application:get_env(rabbitmq_stomp, max_header_length, ?DEFAULT_CONFIGURATION#stomp_configuration.max_header_length),
+                                     max_body_length = application:get_env(rabbitmq_stomp, max_body_length, ?DEFAULT_CONFIGURATION#stomp_configuration.max_body_length)},
 
     report_configuration(Conf),
     Conf.
@@ -121,6 +121,20 @@ report_configuration(#stomp_configuration{
     end,
 
     ok.
+
+init_global_counters() ->
+    lists:foreach(fun init_global_counters/1,
+                  [?STOMP_PROTO_V1_0,
+                   ?STOMP_PROTO_V1_1,
+                   ?STOMP_PROTO_V1_2]).
+
+init_global_counters(ProtoVer) ->
+    Proto = #{protocol => ProtoVer},
+    rabbit_global_counters:init(Proto),
+    rabbit_global_counters:init(Proto#{queue_type => rabbit_classic_queue}),
+    rabbit_global_counters:init(Proto#{queue_type => rabbit_quorum_queue}),
+    rabbit_global_counters:init(Proto#{queue_type => rabbit_stream_queue}),
+    rabbit_msg_size_metrics:init(ProtoVer).
 
 list() ->
     [Client ||

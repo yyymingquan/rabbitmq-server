@@ -2,7 +2,7 @@
 %% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at https://mozilla.org/MPL/2.0/.
 %%
-%% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+%% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term "Broadcom" refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
 %%
 
 -module(rabbit_stomp_frame).
@@ -22,13 +22,14 @@ initial_state() -> {none, ?DEFAULT_STOMP_PARSER_CONFIG}.
 initial_state(Config) -> {none, Config}.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% STOMP 1.1 frames basic syntax
+%% STOMP 1.0/1.1/1.2 frame syntax
+%%
 %%  Rabbit modifications:
-%%  o   CR LF is equivalent to LF in all element terminators (eol).
-%%  o   Escape codes for header names and values include \r for CR
-%%      and CR is not allowed.
-%%  o   Header names and values are not limited to UTF-8 strings.
-%%  o   Header values may contain unescaped colons
+%%  - CR LF is equivalent to LF in all element terminators (eol)
+%%  - Escape codes for header names and values include \r for CR
+%%    and CR is not allowed
+%%  - Header names and values are not limited to UTF-8 strings
+%%  - Header values may contain unescaped colons
 %%
 %%  frame_seq   ::= *(noise frame)
 %%  noise       ::= *(NUL | eol)
@@ -42,156 +43,199 @@ initial_state(Config) -> {none, Config}.
 %%  hdrvalue    ::= *esc_char
 %%  esc_char    ::= HDROCT | BACKSLASH ESCCODE
 %%
-%% Terms in CAPS all represent sets (alternatives) of single octets.
-%% They are defined here using a small extension of BNF, minus (-):
-%%
-%%    term1 - term2         denotes any of the possibilities in term1
-%%                          excluding those in term2.
-%% In this grammar minus is only used for sets of single octets.
-%%
-%%  OCTET       ::= '00'x..'FF'x            % any octet
-%%  NUL         ::= '00'x                   % the zero octet
-%%  LF          ::= '\n'                    % '0a'x newline or linefeed
-%%  CR          ::= '\r'                    % '0d'x carriage return
-%%  NOTEOL      ::= OCTET - (CR | LF)       % any octet except CR or LF
-%%  BACKSLASH   ::= '\\'                    % '5c'x
+%%  OCTET       ::= '00'x..'FF'x
+%%  NUL         ::= '00'x
+%%  LF          ::= '\n'
+%%  CR          ::= '\r'
+%%  NOTEOL      ::= OCTET - (CR | LF)
+%%  BACKSLASH   ::= '\\'
 %%  ESCCODE     ::= 'c' | 'n' | 'r' | BACKSLASH
 %%  COLON       ::= ':'
 %%  HDROCT      ::= NOTEOL - (COLON | BACKSLASH)
-%%                                          % octets allowed in a header
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-%% explicit frame characters
+%% Frame characters
 -define(NUL,   0).
 -define(CR,    $\r).
 -define(LF,    $\n).
 -define(BSL,   $\\).
 -define(COLON, $:).
 
-%% header escape codes
+%% Header escape codes
 -define(LF_ESC,    $n).
 -define(BSL_ESC,   $\\).
 -define(COLON_ESC, $c).
 -define(CR_ESC,    $r).
 
--define(COMMAND_TREE,
-        #{$S => #{$E => #{$N => #{$D => 'SEND'}},
-                  $U => #{$B => #{$S => #{$C => #{$R => #{$I => #{$B => #{$E => 'SUBSCRIBE'}}}}}}},
-                  $T => #{$O => #{$M => #{$P => 'STOMP'}}}},
-          $U => #{$N => #{$S => #{$U => #{$B => #{$S => #{$C => #{$R => #{$I => #{$B => #{$E => 'UNSUBSCRIBE'}}}}}}}}}},
-          $B => #{$E => #{$G => #{$I => #{$N => 'BEGIN'}}}},
-          $C => #{$O => #{$M => #{$M => #{$I => #{$T => 'COMMIT'}}},
-                          $N => #{$N => #{$E => #{$C => #{$T => {'CONNECT',
-                                                                 #{$E => #{$D => 'CONNECTED'}}}}}}}}},
-          $A => #{$B => #{$O => #{$R => #{$T => 'ABORT'}}},
-                  $C => #{$K => 'ACK'}},
-          $N => #{$A => #{$C => #{$K => 'NACK'}}},
-          $D => #{$I => #{$S => #{$C => #{$O => #{$N => #{$N => #{$E => #{$C => #{$T => 'DISCONNECT'}}}}}}}}},
-          $M => #{$E => #{$S => #{$S => #{$A => #{$G => #{$E => 'MESSAGE'}}}}}},
-          $R => #{$E => #{$C => #{$E => #{$I => #{$P => #{$T => 'RECEIPT'}}}}}},
-          $E => #{$R => #{$R => #{$O => #{$R => 'ERROR'}}}}}).
+%% Command lookup: binary -> atom for known STOMP commands.
+%% Unknown commands pass through as binaries.
+-define(KNOWN_COMMANDS,
+        #{<<"SEND">>        => 'SEND',
+          <<"SUBSCRIBE">>   => 'SUBSCRIBE',
+          <<"UNSUBSCRIBE">> => 'UNSUBSCRIBE',
+          <<"STOMP">>       => 'STOMP',
+          <<"CONNECT">>     => 'CONNECT',
+          <<"CONNECTED">>   => 'CONNECTED',
+          <<"DISCONNECT">>  => 'DISCONNECT',
+          <<"BEGIN">>       => 'BEGIN',
+          <<"COMMIT">>      => 'COMMIT',
+          <<"ABORT">>       => 'ABORT',
+          <<"ACK">>         => 'ACK',
+          <<"NACK">>        => 'NACK',
+          <<"MESSAGE">>     => 'MESSAGE',
+          <<"RECEIPT">>     => 'RECEIPT',
+          <<"ERROR">>       => 'ERROR'}).
 
-%% parser state
--record(state, {acc, cmd, cmd_tree = ?COMMAND_TREE, hdrs, hdrname, hdrl = 0,
-                config}).
+%% The longest known STOMP command is UNSUBSCRIBE (11 bytes).
+%% Allow some headroom for unknown commands but bound memory usage.
+-define(MAX_COMMAND_LENGTH, 32).
+
+%% Parser state
+-record(ps, {acc     = [] :: [byte()],
+             acc_len = 0  :: non_neg_integer(),
+             cmd          :: atom() | binary() | undefined,
+             hdrs    = [] :: [{string(), string()}],
+             hdrname      :: string() | undefined,
+             config       :: #stomp_parser_config{}}).
+
+%%
+%% Public API
+%%
 
 parse(Content, {resume, Continuation}) -> Continuation(Content);
-parse(Content, {none, Config}                 ) -> parser(Content, noframe, #state{config=Config}).
+parse(Content, {none, Config})         -> parser(Content, noise, #ps{config = Config}).
+
+%%
+%% Incremental state machine parser
+%%
+%% Phases: noise | command | headers | hdrname | hdrvalue
+%% Body parsing is handled separately by parse_body/2.
+%%
 
 more(Continuation) -> {more, {resume, Continuation}}.
 
-%% Single-function parser: Term :: noframe | command | headers | hdrname | hdrvalue
-%% general more and line-end detection
-parser(<<>>,                        Term    ,  State) -> more(fun(Rest) -> parser(Rest, Term, State) end);
-parser(<<?CR>>,                     Term    ,  State) -> more(fun(Rest) -> parser(<<?CR, Rest/binary>>, Term, State) end);
-parser(<<?CR, ?LF,   Rest/binary>>, Term    ,  State) -> parser(<<?LF, Rest/binary>>, Term, State);
-parser(<<?CR, Ch:8, _Rest/binary>>, Term    , _State) -> {error, {unexpected_chars(Term), [?CR, Ch]}};
-%% escape processing (only in hdrname and hdrvalue terms)
-parser(<<?BSL>>,                    Term    ,  State) -> more(fun(Rest) -> parser(<<?BSL, Rest/binary>>, Term, State) end);
-parser(<<?BSL, Ch:8, Rest/binary>>, Term    ,  State)
-                               when Term == hdrname;
-                                    Term == hdrvalue  -> unescape(Ch, fun(Ech) -> parser(Rest, Term, accum(Ech, State)) end);
-%% inter-frame noise
-parser(<<?NUL,       Rest/binary>>, noframe ,  State) -> parser(Rest, noframe, State);
-parser(<<?LF,        Rest/binary>>, noframe ,  State) -> parser(Rest, noframe, State);
-%% detect transitions
-parser(              Rest,          noframe ,  State) -> goto(noframe,  command,  Rest, State);
-parser(<<?LF,        Rest/binary>>, command ,  State) -> goto(command,  headers,  Rest, State);
-parser(<<?LF,        Rest/binary>>, headers ,  State) -> goto(headers,  body,     Rest, State);
-parser(              Rest,          headers ,  State) -> goto(headers,  hdrname,  Rest, State);
-parser(<<?COLON,     Rest/binary>>, hdrname ,  State) -> goto(hdrname,  hdrvalue, Rest, State);
-parser(<<?LF,        Rest/binary>>, hdrname ,  State) -> goto(hdrname,  headers,  Rest, State);
-parser(<<?LF,        Rest/binary>>, hdrvalue,  State) -> goto(hdrvalue, headers,  Rest, State);
-parser(<<Ch:8,       Rest/binary>>,   command ,  #state{cmd_tree = {_, CmdTree}} = State) ->
-    case maps:get(Ch, CmdTree, undefined) of
-        undefined -> {error, unknown_command};
-        NewCmdTree -> parser(Rest, command, State#state{cmd_tree = NewCmdTree})
-    end;
-parser(<<Ch:8,       Rest/binary>>,   command ,  #state{cmd_tree = #{} = CmdTree} = State) ->
-    case maps:get(Ch, CmdTree, undefined) of
-        undefined -> {error, unknown_command};
-        NewCmdTree -> parser(Rest, command, State#state{cmd_tree = NewCmdTree})
-    end;
-parser(<<_Ch:8,       _Rest/binary>>,   command ,  _) ->
-    {error, unknown_command};
-%% accumulate
-%% parser(<<Ch:8,       Rest/binary>>, Term = hdrname    ,  State = #state{config = #stomp_parser_config{max_header_length = MaxHeaderLength}}) ->
+%% --- Need more data ---
+parser(<<>>,                        Phase,  S) -> more(fun(Rest) -> parser(Rest, Phase, S) end);
+parser(<<?CR>>,                     Phase,  S) -> more(fun(Rest) -> parser(<<?CR, Rest/binary>>, Phase, S) end);
 
-%%     parser(Rest, Term, accum(Ch, State));
-%% parser(<<Ch:8,       Rest/binary>>, Term = hdrvalue    ,  State = #state{config = #stomp_parser_config{max_header_length = MaxHeaderLength}}) ->
-%%     parser(Rest, Term, accum(Ch, State));
-parser(<<Ch:8,       Rest/binary>>, Term    ,  State) -> parser(Rest, Term, accum(Ch, State)).
+%% --- CR LF normalization ---
+parser(<<?CR, ?LF,   Rest/binary>>, Phase,  S) -> parser(<<?LF, Rest/binary>>, Phase, S);
+parser(<<?CR, Ch:8, _Rest/binary>>, Phase, _S) -> {error, {unexpected_chars(Phase), [?CR, Ch]}};
 
-%% state transitions
-goto(noframe,  command,  Rest, State                                 ) -> parser(Rest, command, State#state{acc = [], cmd_tree = ?COMMAND_TREE});
-goto(command,  headers,  Rest, State = #state{cmd_tree = Command}) when is_atom(Command) ->
-    parser(Rest, headers, State#state{cmd = Command, hdrs = []});
-goto(command,  headers,  Rest, State = #state{cmd_tree = {Command, _}}) when is_atom(Command) ->
-    parser(Rest, headers, State#state{cmd = Command, hdrs = []});
-goto(command,  headers,  _Rest, _State)->
-   {error, unknown_command};
-goto(headers,  body,     Rest, State                                 ) -> parse_body(Rest, State);
-goto(headers,  hdrname,  Rest, State = #state{hdrs = Headers, config = #stomp_parser_config{max_headers = MaxHeaders}}) ->
-    case length(Headers) == MaxHeaders of
-        true -> {error, {max_headeres, MaxHeaders}};
-        _ -> parser(Rest, hdrname, State#state{acc = []})
+%% --- Escape processing (header names and values only) ---
+parser(<<?BSL>>,                    Phase,  S)
+  when Phase =:= hdrname;
+       Phase =:= hdrvalue -> more(fun(Rest) -> parser(<<?BSL, Rest/binary>>, Phase, S) end);
+parser(<<?BSL, Ch:8, Rest/binary>>, Phase,  S)
+  when Phase =:= hdrname;
+       Phase =:= hdrvalue -> unescape(Ch, fun(Ech) -> parser(Rest, Phase, accum(Ech, S)) end);
+
+%% --- Noise: skip NULs and LFs between frames ---
+parser(<<?NUL, Rest/binary>>, noise, S) -> parser(Rest, noise, S);
+parser(<<?LF,  Rest/binary>>, noise, S) -> parser(Rest, noise, S);
+parser(Rest,                  noise, S) -> parser(Rest, command, S#ps{acc = [], acc_len = 0});
+
+%% --- Command: accumulate bytes until LF ---
+parser(<<?LF,        Rest/binary>>, command, S) -> goto(command, headers, Rest, S);
+parser(<<Ch:8,       Rest/binary>>, command, S = #ps{acc_len = Len}) ->
+    case Len >= ?MAX_COMMAND_LENGTH of
+        true  -> {error, {command_too_long, ?MAX_COMMAND_LENGTH}};
+        false -> parser(Rest, command, accum(Ch, S))
     end;
-goto(hdrname,  hdrvalue, Rest, State = #state{acc = Acc}             ) -> parser(Rest, hdrvalue, State#state{acc = [], hdrname = lists:reverse(Acc)});
-goto(hdrname,  headers, _Rest,         #state{acc = Acc}             ) -> {error, {header_no_value, lists:reverse(Acc)}};  % badly formed header -- fatal error
-goto(hdrvalue, headers,  Rest, State = #state{acc = Acc, hdrs = Headers, hdrname = HdrName}) ->
-    parser(Rest, headers, State#state{hdrs = insert_header(Headers, HdrName, lists:reverse(Acc))}).
 
-%% error atom
-unexpected_chars(noframe)  -> unexpected_chars_between_frames;
+%% --- Headers: LF means end of headers (start body), otherwise start a header name ---
+parser(<<?LF,        Rest/binary>>, headers, S) -> goto(headers, body, Rest, S);
+parser(Rest,                        headers, S) -> goto(headers, hdrname, Rest, S);
+
+%% --- Header name: accumulate until COLON or LF ---
+parser(<<?COLON,     Rest/binary>>, hdrname, S) -> goto(hdrname, hdrvalue, Rest, S);
+parser(<<?LF,       _Rest/binary>>, hdrname, #ps{acc = Acc}) ->
+    {error, {header_no_value, lists:reverse(Acc)}};
+parser(<<Ch:8,       Rest/binary>>, hdrname, S = #ps{acc_len = Len,
+                                                      config = #stomp_parser_config{
+                                                                  max_header_length = Max}}) ->
+    case Len >= Max of
+        true  -> {error, {max_header_length, Max}};
+        false -> parser(Rest, hdrname, accum(Ch, S))
+    end;
+
+%% --- Header value: accumulate until LF ---
+parser(<<?LF,        Rest/binary>>, hdrvalue, S) -> goto(hdrvalue, headers, Rest, S);
+parser(<<Ch:8,       Rest/binary>>, hdrvalue, S = #ps{acc_len = Len,
+                                                       config = #stomp_parser_config{
+                                                                   max_header_length = Max}}) ->
+    case Len >= Max of
+        true  -> {error, {max_header_length, Max}};
+        false -> parser(Rest, hdrvalue, accum(Ch, S))
+    end.
+
+%%
+%% State transitions
+%%
+
+goto(command, headers, Rest, S = #ps{acc = Acc}) ->
+    CmdBin = list_to_binary(lists:reverse(Acc)),
+    Cmd = maps:get(CmdBin, ?KNOWN_COMMANDS, CmdBin),
+    parser(Rest, headers, S#ps{cmd = Cmd, hdrs = []});
+
+goto(headers, body, Rest, S) ->
+    parse_body(Rest, S);
+
+goto(headers, hdrname, Rest, S = #ps{hdrs = Headers,
+                                     config = #stomp_parser_config{
+                                                 max_headers = MaxHeaders}}) ->
+    case length(Headers) >= MaxHeaders of
+        true  -> {error, {max_headers, MaxHeaders}};
+        false -> parser(Rest, hdrname, S#ps{acc = [], acc_len = 0})
+    end;
+
+goto(hdrname, hdrvalue, Rest, S = #ps{acc = Acc}) ->
+    parser(Rest, hdrvalue, S#ps{acc = [], acc_len = 0,
+                                hdrname = lists:reverse(Acc)});
+
+goto(hdrvalue, headers, Rest, S = #ps{acc = Acc, hdrs = Headers, hdrname = HdrName}) ->
+    parser(Rest, headers, S#ps{hdrs = insert_header(Headers, HdrName,
+                                                    lists:reverse(Acc))}).
+
+%%
+%% Helpers
+%%
+
+unexpected_chars(noise)    -> unexpected_chars_between_frames;
 unexpected_chars(command)  -> unexpected_chars_in_command;
 unexpected_chars(hdrname)  -> unexpected_chars_in_header;
 unexpected_chars(hdrvalue) -> unexpected_chars_in_header;
-unexpected_chars(_Term)    -> unexpected_chars.
+unexpected_chars(_)        -> unexpected_chars.
 
-%% general accumulation
-accum(Ch, State = #state{acc = Acc}) -> State#state{acc = [Ch | Acc]}.
+accum(Ch, S = #ps{acc = Acc, acc_len = Len}) ->
+    S#ps{acc = [Ch | Acc], acc_len = Len + 1}.
 
-%% resolve escapes (with error processing)
 unescape(?LF_ESC,    Fun) -> Fun(?LF);
 unescape(?BSL_ESC,   Fun) -> Fun(?BSL);
 unescape(?COLON_ESC, Fun) -> Fun(?COLON);
 unescape(?CR_ESC,    Fun) -> Fun(?CR);
 unescape(Ch,        _Fun) -> {error, {bad_escape, [?BSL, Ch]}}.
 
-%% insert header unless aleady seen
+%% First occurrence of a header name wins
 insert_header(Headers, Name, Value) ->
     case lists:keymember(Name, 1, Headers) of
-        true  -> Headers; % first header only
+        true  -> Headers;
         false -> [{Name, Value} | Headers]
     end.
 
-parse_body(Content, State) ->
-    #state{cmd = Cmd, hdrs = Hdrs, config = #stomp_parser_config{max_body_length = MaxBodyLength}} = State,
+%%
+%% Body parsing
+%%
+
+parse_body(Content, #ps{cmd = Cmd, hdrs = Hdrs,
+                        config = #stomp_parser_config{
+                                   max_body_length = MaxBodyLength}}) ->
     Frame = #stomp_frame{command = Cmd, headers = Hdrs},
     case Cmd of
         'SEND' ->
             case integer_header(Frame, ?HEADER_CONTENT_LENGTH, unknown) of
-                ContentLength when is_integer(ContentLength) and (ContentLength > MaxBodyLength) ->
+                ContentLength when is_integer(ContentLength),
+                                   ContentLength > MaxBodyLength ->
                     {error, {max_body_length, ContentLength}};
                 ContentLength when is_integer(ContentLength) ->
                     parse_known_body(Content, Frame, [], ContentLength);
@@ -208,15 +252,15 @@ parse_body(Content, State) ->
 
 parse_unknown_body(Content, Frame, Chunks, Remaining) ->
     case firstnull(Content) of
-        -1  ->
+        -1 ->
             ChunkSize = byte_size(Content),
             case ChunkSize > Remaining of
-                true ->  {error, {max_body_length, unknown}};
+                true  -> {error, {max_body_length, unknown}};
                 false -> ?MORE_BODY(Content, Frame, Chunks, Remaining - ChunkSize)
             end;
         Pos ->
             case Pos > Remaining of
-                true ->  {error, {max_body_length, unknown}};
+                true  -> {error, {max_body_length, unknown}};
                 false -> finish_body(Content, Frame, Chunks, Pos)
             end
     end.
@@ -224,8 +268,7 @@ parse_unknown_body(Content, Frame, Chunks, Remaining) ->
 parse_known_body(Content, Frame, Chunks, Remaining) ->
     Size = byte_size(Content),
     case Remaining >= Size of
-        true  ->
-            ?MORE_BODY(Content, Frame, Chunks, Remaining - Size);
+        true  -> ?MORE_BODY(Content, Frame, Chunks, Remaining - Size);
         false -> finish_body(Content, Frame, Chunks, Remaining)
     end.
 
@@ -236,6 +279,16 @@ finish_body(Content, Frame, Chunks, Pos) ->
 
 finalize_chunk(<<>>,  Chunks) -> Chunks;
 finalize_chunk(Chunk, Chunks) -> [Chunk | Chunks].
+
+firstnull(Content) -> firstnull(Content, 0).
+
+firstnull(<<>>,                _N) -> -1;
+firstnull(<<0,  _Rest/binary>>, N) -> N;
+firstnull(<<_Ch, Rest/binary>>, N) -> firstnull(Rest, N + 1).
+
+%%
+%% Header accessors
+%%
 
 default_value({ok, Value}, _DefaultValue) -> Value;
 default_value(not_found,    DefaultValue) -> DefaultValue.
@@ -252,7 +305,6 @@ boolean_header(#stomp_frame{headers = Headers}, Key) ->
     case lists:keysearch(Key, 1, Headers) of
         {value, {_, "true"}}  -> {ok, true};
         {value, {_, "false"}} -> {ok, false};
-        %% some Python clients serialize True/False as "True"/"False"
         {value, {_, "True"}}  -> {ok, true};
         {value, {_, "False"}} -> {ok, false};
         _                     -> not_found
@@ -281,18 +333,12 @@ binary_header(F, K, D) -> default_value(binary_header(F, K), D).
 
 stream_offset_header(F) ->
     case binary_header(F, ?HEADER_X_STREAM_OFFSET) of
-        {ok, <<"first">>} ->
-            {longstr, <<"first">>};
-        {ok, <<"last">>} ->
-            {longstr, <<"last">>};
-        {ok, <<"next">>} ->
-            {longstr, <<"next">>};
-        {ok, <<"offset=", OffsetValue/binary>>} ->
-            {long, binary_to_integer(OffsetValue)};
-        {ok, <<"timestamp=", TimestampValue/binary>>} ->
-            {timestamp, binary_to_integer(TimestampValue)};
-        _ ->
-            not_found
+        {ok, <<"first">>}                    -> {longstr, <<"first">>};
+        {ok, <<"last">>}                     -> {longstr, <<"last">>};
+        {ok, <<"next">>}                     -> {longstr, <<"next">>};
+        {ok, <<"offset=", V/binary>>}        -> {long, binary_to_integer(V)};
+        {ok, <<"timestamp=", V/binary>>}     -> {timestamp, binary_to_integer(V)};
+        _                                    -> not_found
     end.
 
 stream_filter_header(F) ->
@@ -300,7 +346,7 @@ stream_filter_header(F) ->
         {ok, Str} ->
             {array, lists:reverse(
                       lists:foldl(fun(V, Acc) ->
-                                          [{longstr, V}] ++ Acc
+                                          [{longstr, V} | Acc]
                                   end,
                                   [],
                                   binary:split(Str, <<",">>, [global])))};
@@ -308,11 +354,13 @@ stream_filter_header(F) ->
             not_found
     end.
 
+%%
+%% Serialization
+%%
+
 serialize(Frame) ->
     serialize(Frame, true).
 
-%% second argument controls whether a trailing linefeed
-%% character should be added, see rabbitmq/rabbitmq-stomp#39.
 serialize(Frame, true) ->
     serialize(Frame, false) ++ [?LF];
 serialize(#stomp_frame{command = Command,
@@ -351,9 +399,3 @@ escape1(?BSL)   -> [?BSL, ?BSL_ESC];
 escape1(?LF)    -> [?BSL, ?LF_ESC];
 escape1(?CR)    -> [?BSL, ?CR_ESC];
 escape1(Ch)     -> Ch.
-
-firstnull(Content) -> firstnull(Content, 0).
-
-firstnull(<<>>,                _N) -> -1;
-firstnull(<<0,  _Rest/binary>>, N) -> N;
-firstnull(<<_Ch, Rest/binary>>, N) -> firstnull(Rest, N+1).

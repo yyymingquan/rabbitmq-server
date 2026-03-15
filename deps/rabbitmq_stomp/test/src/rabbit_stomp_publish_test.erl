@@ -27,7 +27,7 @@ run() ->
     Self = self(),
     spawn(fun() -> publish(Self, Pub, 0, erlang:monotonic_time()) end),
     rabbit_stomp_client:send(
-      Recv, "SUBSCRIBE", [{"destination", ?DESTINATION}]),
+      Recv, 'SUBSCRIBE', [{"destination", ?DESTINATION}]),
     spawn(fun() -> recv(Self, Recv, 0, erlang:monotonic_time()) end),
     report().
 
@@ -53,7 +53,7 @@ report() ->
 
 publish(Owner, Client, Count, TS) ->
     rabbit_stomp_client:send(
-      Client, "SEND", [{"destination", ?DESTINATION}],
+      Client, 'SEND', [{"destination", ?DESTINATION}],
       [integer_to_list(Count)]),
     Diff = erlang:convert_time_unit(
       erlang:monotonic_time() - TS, native, microseconds),
@@ -65,7 +65,7 @@ publish(Owner, Client, Count, TS) ->
     end.
 
 recv(Owner, Client0, Count, TS) ->
-    {#stomp_frame{body_iolist = Body}, Client1} =
+    {#stomp_frame{body_iolist_rev = Body}, Client1} =
         rabbit_stomp_client:recv(Client0),
     BodyInt = list_to_integer(binary_to_list(iolist_to_binary(Body))),
     Count = BodyInt,

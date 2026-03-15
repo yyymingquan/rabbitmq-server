@@ -38,7 +38,8 @@ groups() ->
         temp_destination_queue,
         temp_destination_in_send,
         blank_destination_in_send,
-        stream_filtering
+        stream_filtering,
+        global_counters
     ],
 
     [{version_to_group_name(V), [sequence], Tests}
@@ -119,18 +120,63 @@ end_per_testcase0(publish_unauthorized_error, Config) ->
 end_per_testcase0(_, Config) ->
     Config.
 
+global_counters(Config) ->
+    Version = ?config(version, Config),
+    ProtoVer = stomp_proto_ver(Version),
+    Dest = "/topic/counter-test-" ++ Version,
+
+    C0 = get_global_counters(Config, ProtoVer),
+    Pubs0 = maps:get(publishers, C0, 0),
+    Cons0 = maps:get(consumers, C0, 0),
+    Recv0 = maps:get(messages_received_total, C0, 0),
+    Routed0 = maps:get(messages_routed_total, C0, 0),
+
+    Client = ?config(stomp_client, Config),
+    rabbit_stomp_client:send(
+      Client, 'SUBSCRIBE',
+      [{"destination", Dest}, {"id", "counter-sub"}]),
+
+    rabbit_stomp_client:send(
+      Client, 'SEND', [{"destination", Dest}], ["hello"]),
+
+    {ok, Client1, _Hdrs, _Body} = stomp_receive(Client, 'MESSAGE'),
+
+    C1 = get_global_counters(Config, ProtoVer),
+    ?assertEqual(Pubs0 + 1, maps:get(publishers, C1)),
+    ?assertEqual(Cons0 + 1, maps:get(consumers, C1)),
+    ?assertEqual(Recv0 + 1, maps:get(messages_received_total, C1)),
+    ?assertEqual(Routed0 + 1, maps:get(messages_routed_total, C1)),
+
+    rabbit_stomp_client:send(
+      Client1, 'UNSUBSCRIBE', [{"id", "counter-sub"}]),
+
+    timer:sleep(100),
+    C2 = get_global_counters(Config, ProtoVer),
+    ?assertEqual(Cons0, maps:get(consumers, C2)),
+
+    ok.
+
+get_global_counters(Config, ProtoVer) ->
+    maps:get(#{protocol => ProtoVer},
+             rabbit_ct_broker_helpers:rpc(
+               Config, 0, rabbit_global_counters, overview, [])).
+
+stomp_proto_ver("1.0") -> 'STOMP 1.0';
+stomp_proto_ver("1.1") -> 'STOMP 1.1';
+stomp_proto_ver("1.2") -> 'STOMP 1.2'.
+
 publish_no_dest_error(Config) ->
     Client = ?config(stomp_client, Config),
     rabbit_stomp_client:send(
       Client, 'SEND', [{"destination", "/exchange/non-existent"}], ["hello"]),
-    {ok, _Client1, Hdrs, _} = stomp_receive(Client, "ERROR"),
+    {ok, _Client1, Hdrs, _} = stomp_receive(Client, 'ERROR'),
     "not_found" = proplists:get_value("message", Hdrs),
     ok.
 
 publish_unauthorized_error(Config) ->
     ClientFoo = ?config(client_foo, Config),
     rabbit_stomp_client:send(
-      ClientFoo, "SEND", [{"destination", "/amq/queue/RestrictedQueue"}], ["hello"]),
+      ClientFoo, 'SEND', [{"destination", "/amq/queue/RestrictedQueue"}], ["hello"]),
     {ok, _Client1, Hdrs, _} = stomp_receive(ClientFoo, 'ERROR'),
     "access_refused" = proplists:get_value("message", Hdrs),
     ok.
@@ -180,17 +226,17 @@ subscribe_with_x_priority(Config) ->
 
     %% subscribe and wait for receipt
     rabbit_stomp_client:send(
-      ClientA, "SUBSCRIBE", [{"destination", ?DESTINATION_QQ}, {"receipt", "foo"}]),
-    {ok, _ClientA1, _, _} = stomp_receive(ClientA, "RECEIPT"),
+      ClientA, 'SUBSCRIBE', [{"destination", ?DESTINATION_QQ}, {"receipt", "foo"}]),
+    {ok, _ClientA1, _, _} = stomp_receive(ClientA, 'RECEIPT'),
 
     %% subscribe with a higher priority and wait for receipt
     {ok, ClientB} = rabbit_stomp_client:connect(Version, StompPort),
     rabbit_stomp_client:send(
-      ClientB, "SUBSCRIBE", [{"destination", ?DESTINATION_QQ},
-                             {"receipt", "foo"},
-                             {"x-priority", 10}
-                            ]),
-    {ok, ClientB1, _, _} = stomp_receive(ClientB, "RECEIPT"),
+      ClientB, 'SUBSCRIBE', [{"destination", ?DESTINATION_QQ},
+                              {"receipt", "foo"},
+                              {"x-priority", 10}
+                             ]),
+    {ok, ClientB1, _, _} = stomp_receive(ClientB, 'RECEIPT'),
 
     %% send from amqp
     Method = #'basic.publish'{exchange = <<"">>, routing_key = ?QUEUE_QQ},
@@ -199,7 +245,7 @@ subscribe_with_x_priority(Config) ->
                                                  payload = <<"hello">>}),
 
     %% ClientB should receive the message since it has a higher priority
-    {ok, _ClientB2, _, [<<"hello">>]} = stomp_receive(ClientB1, "MESSAGE"),
+    {ok, _ClientB2, _, [<<"hello">>]} = stomp_receive(ClientB1, 'MESSAGE'),
     #'queue.delete_ok'{} =
         amqp_channel:call(Channel, #'queue.delete'{queue = ?QUEUE_QQ}),
     ok.
@@ -438,7 +484,7 @@ stream_filtering(Config) ->
       Client6, 'UNSUBSCRIBE', [{"destination", StreamDestination},
                                {"id", "0"},
                                {"receipt", "bar"}]),
-    {ok, Client7, _, _} = stomp_receive(Client6, "RECEIPT"),
+    {ok, Client7, _, _} = stomp_receive(Client6, 'RECEIPT'),
 
     %% filtering on "apple" and "orange"
     rabbit_stomp_client:send(
@@ -461,14 +507,14 @@ stream_filtering(Config) ->
     %% we should have only the "apple" and "orange" messages
     ?assert(length(AppleOrangeFilteredMessages) =:= WaveCount * 2),
     rabbit_stomp_client:send(
-      Client8, "UNSUBSCRIBE", [{"destination", StreamDestination},
-                               {"id", "0"},
-                               {"receipt", "bar"}]),
-    {ok, Client9, _, _} = stomp_receive(Client8, "RECEIPT"),
+      Client8, 'UNSUBSCRIBE', [{"destination", StreamDestination},
+                                {"id", "0"},
+                                {"receipt", "bar"}]),
+    {ok, Client9, _, _} = stomp_receive(Client8, 'RECEIPT'),
 
     %% filtering on "apple" and messages without a filter value
     rabbit_stomp_client:send(
-      Client9, "SUBSCRIBE",
+      Client9, 'SUBSCRIBE',
       [{"destination", StreamDestination},
        {"id", "0"},
        {"ack", "client"},
@@ -491,7 +537,7 @@ stream_filtering(Config) ->
       Client10, 'UNSUBSCRIBE', [{"destination", StreamDestination},
                                {"id", "0"},
                                {"receipt", "bar"}]),
-    {ok, _, _, _} = stomp_receive(Client10, "RECEIPT"),
+    {ok, _, _, _} = stomp_receive(Client10, 'RECEIPT'),
 
     Channel = ?config(amqp_channel, Config),
     #'queue.delete_ok'{} = amqp_channel:call(Channel,
@@ -518,7 +564,7 @@ stomp_receive_messages(Client, Acc, Version) ->
 stomp_receive(Client, Command) ->
     {#stomp_frame{command     = Command,
                   headers     = Hdrs,
-                  body_iolist = Body},   Client1} =
+                  body_iolist_rev = Body},   Client1} =
     rabbit_stomp_client:recv(Client),
     {ok, Client1, Hdrs, Body}.
 

@@ -44,9 +44,9 @@ send(Client, Command, Headers) ->
 
 send({Sock, _}, Command, Headers, Body) ->
     Frame = rabbit_stomp_frame:serialize(
-              #stomp_frame{command     = list_to_binary(Command),
+              #stomp_frame{command     = Command,
                            headers     = Headers,
-                           body_iolist = Body}),
+                           body_iolist_rev = Body}),
     gen_tcp:send(Sock, Frame).
 
 recv_state(Sock) ->

@@ -12,7 +12,6 @@
 -include_lib("kernel/include/logger.hrl").
 -include_lib("rabbitmq_stomp/include/rabbit_stomp.hrl").
 -include_lib("rabbitmq_stomp/include/rabbit_stomp_frame.hrl").
--include_lib("amqp_client/include/amqp_client.hrl").
 -include_lib("rabbit_common/include/logging.hrl").
 
 %% Websocket.
@@ -154,7 +153,7 @@ close_connection(Pid, Reason) ->
         exit:{noproc, _} -> ok
     end.
 
-init_processor_state(#state{socket=Sock, peername=PeerAddr, auth_hd=AuthHd}) ->
+init_processor_state(#state{socket=Sock, conn_name=ConnName, auth_hd=AuthHd}) ->
     Self = self(),
     SendFun = fun(Data) ->
                       Self ! {send, Data},
@@ -170,7 +169,6 @@ init_processor_state(#state{socket=Sock, peername=PeerAddr, auth_hd=AuthHd}) ->
         true ->
             case AuthHd of
                 undefined ->
-                    %% We fall back to the default STOMP credentials.
                     StompConfig1#stomp_configuration{force_default_creds = true};
                 _ ->
                     {basic, HTTPLogin, HTTPPassCode}
@@ -184,12 +182,21 @@ init_processor_state(#state{socket=Sock, peername=PeerAddr, auth_hd=AuthHd}) ->
             StompConfig1
     end,
 
-    AdapterInfo = amqp_connection:socket_adapter_info(Sock, {'Web STOMP', 0}),
     RealSocket = rabbit_net:unwrap_socket(Sock),
     LoginNameFromCertificate = rabbit_stomp_reader:ssl_login_name(RealSocket, StompConfig2),
+    {PeerHost, PeerPort, Host, Port} =
+        case rabbit_net:socket_ends(Sock, inbound) of
+            {ok, Ends} -> Ends;
+            {error, _} -> {undefined, 0, undefined, 0}
+        end,
+    ConnNameBin = case ConnName of
+                      undefined -> <<"unknown">>;
+                      _ -> rabbit_data_coercion:to_binary(ConnName)
+                  end,
     ProcessorState = rabbit_stomp_processor:initial_state(
         StompConfig2,
-        {SendFun, AdapterInfo, LoginNameFromCertificate, PeerAddr}),
+        {SendFun, LoginNameFromCertificate, ConnNameBin,
+         Host, Port, PeerHost, PeerPort}),
     {ok, ProcessorState}.
 
 websocket_handle({text, Data}, State) ->
@@ -256,17 +263,6 @@ websocket_info({'$gen_cast', QueueEvent = {queue_event, _, _}}, State) ->
             stop(State#state{proc_state = NewProcState})
     end;
 
-%%----------------------------------------------------------------------------
-%% websocket_info({'EXIT', From, Reason},
-%%                State=#state{ proc_state = ProcState0 }) ->
-%%   case rabbit_stomp_processor:handle_exit(From, Reason, ProcState0) of
-%%     {stop, _Reason, ProcState} ->
-%%         stop(State#state{ proc_state = ProcState });
-%%     unknown_exit ->
-%%         %% Allow the server to send remaining error messages
-%%         self() ! close_websocket,
-%%         {ok, State}
-%%   end;
 websocket_info(close_websocket, State) ->
     stop(State);
 
@@ -411,11 +407,6 @@ maybe_emit_stats(State) ->
     rabbit_event:if_enabled(State, #state.stats_timer,
                                 fun() -> emit_stats(State) end).
 
-%% emit_stats(State=#state{connection = C}) when C == none; C == undefined ->
-%%     %% Avoid emitting stats on terminate when the connection has not yet been
-%%     %% established, as this causes orphan entries on the stats database
-%%     State1 = rabbit_event:reset_stats_timer(State, #state.stats_timer),
-%%     State1;
 emit_stats(State=#state{socket=Sock, state=RunningState}) ->
     SockInfos = case rabbit_net:getstat(Sock,
             [recv_oct, recv_cnt, send_oct, send_cnt, send_pend]) of
@@ -446,17 +437,24 @@ info_internal(garbage_collection, _State) ->
 info_internal(reductions, _State) ->
     {reductions, Reductions} = erlang:process_info(self(), reductions),
     Reductions;
-info_internal(timeout, State) ->
-    %% TODO: real value
+info_internal(timeout, _State) ->
     0;
 info_internal(conn_name, #state{conn_name = Val}) ->
     rabbit_data_coercion:to_binary(Val);
 info_internal(name, #state{conn_name = Val}) ->
     rabbit_data_coercion:to_binary(Val);
-info_internal(connection, #state{connection = _Val}) ->
+info_internal(connection, _) ->
     self();
 info_internal(connection_state, #state{state = Val}) ->
     Val;
+info_internal(ssl, #state{socket = Sock}) ->
+    rabbit_net:proxy_ssl_info(Sock, undefined) /= nossl;
+info_internal(SSL, #state{socket = Sock})
+  when SSL =:= ssl_protocol;
+       SSL =:= ssl_key_exchange;
+       SSL =:= ssl_cipher;
+       SSL =:= ssl_hash ->
+    rabbit_ssl:info(SSL, {Sock, undefined});
 info_internal(Key, #state{proc_state = ProcState}) ->
     rabbit_stomp_processor:info(Key, ProcState).
 

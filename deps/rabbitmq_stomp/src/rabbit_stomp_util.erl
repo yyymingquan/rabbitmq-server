@@ -10,13 +10,14 @@
 -export([parse_message_id/1, subscription_queue_name/3]).
 -export([longstr_field/2]).
 -export([ack_mode/1, consumer_tag_reply_to/1, consumer_tag/1, message_headers/1,
-         headers_post_process/1, headers/5, message_properties/1, tag_to_id/1,
+         headers_post_process/1, headers/9, message_properties/1, tag_to_id/1,
          msg_header_name/1, ack_header_name/1, build_arguments/1, build_params/2,
          has_durable_header/1]).
 -export([negotiate_version/2]).
 -export([trim_headers/1]).
 
--include_lib("amqp_client/include/amqp_client.hrl").
+-include_lib("rabbit_common/include/rabbit.hrl").
+-include_lib("rabbit_common/include/rabbit_framing.hrl").
 -include("rabbit_stomp_frame.hrl").
 -include("rabbit_stomp_headers.hrl").
 
@@ -111,12 +112,9 @@ adhoc_convert_headers(Headers, Existing) ->
                         Acc
                 end, Existing, Headers).
 
-headers_extra(SessionId, AckMode, Version,
-              #'basic.deliver'{consumer_tag = ConsumerTag,
-                               delivery_tag = DeliveryTag,
-                               exchange     = ExchangeBin,
-                               routing_key  = RoutingKeyBin,
-                               redelivered  = Redelivered}) ->
+headers_extra(SessionId, ConsumerTag, DeliveryTag,
+              ExchangeBin, RoutingKeyBin, Redelivered,
+              AckMode, Version) ->
     case tag_to_id(ConsumerTag) of
         {ok, {internal, Id}} -> [{?HEADER_SUBSCRIPTION, Id}];
         _                    -> []
@@ -144,8 +142,12 @@ headers_post_process(Headers) ->
              Header
      end || Header <- Headers].
 
-headers(SessionId, Delivery, Properties, AckMode, Version) ->
-    headers_extra(SessionId, AckMode, Version, Delivery) ++
+headers(SessionId, ConsumerTag, DeliveryTag,
+        ExchangeBin, RoutingKey, Redelivered,
+        Properties, AckMode, Version) ->
+    headers_extra(SessionId, ConsumerTag, DeliveryTag,
+                  ExchangeBin, RoutingKey, Redelivered,
+                  AckMode, Version) ++
     headers_post_process(message_headers(Properties)).
 
 tag_to_id(<<?INTERNAL_TAG_PREFIX, Id/binary>>) ->

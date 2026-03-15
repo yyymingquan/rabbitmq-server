@@ -30,13 +30,19 @@ define PROJECT_APP_EXTRA_KEYS
 	{broker_version_requirements, []}
 endef
 
-DEPS = ranch rabbit_common rabbit amqp_client
+DEPS = ranch rabbit_common rabbit
 TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_management
 
 PLT_APPS += rabbitmq_cli elixir ssl
 
 DEP_EARLY_PLUGINS = rabbit_common/mk/rabbitmq-early-plugin.mk
 DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk
+
+# Generate per-function CT test cases from Python test files
+test/python_SUITE_generated.hrl: $(wildcard test/python_SUITE_data/src/*.py) test/generate_python_tests.py
+	python3 test/generate_python_tests.py test/python_SUITE_data/src $@
+
+test/python_SUITE.erl:: test/python_SUITE_generated.hrl
 
 include ../../rabbitmq-components.mk
 include ../../erlang.mk

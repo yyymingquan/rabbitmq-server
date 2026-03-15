@@ -106,10 +106,19 @@ proxy_protocol_v2_local(Config) ->
     ok.
 
 connection_name() ->
-    Connections = ets:tab2list(connection_created),
-    {_Key, Values} = lists:nth(1, Connections),
-    {_, Name} = lists:keyfind(conn_name, 1, Values),
-    Name.
+    connection_name(50).
+
+connection_name(0) ->
+    error(no_stomp_connection_found);
+connection_name(Retries) ->
+    case ets:tab2list(connection_created) of
+        [{_Key, Values} | _] ->
+            {_, Name} = lists:keyfind(conn_name, 1, Values),
+            Name;
+        [] ->
+            timer:sleep(50),
+            connection_name(Retries - 1)
+    end.
 
 merge_app_env(StompConfig, Config) ->
     rabbit_ct_helpers:merge_app_env(Config, StompConfig).

@@ -17,6 +17,10 @@
 
 -define(SUPPORTED_VERSIONS, ["1.0", "1.1", "1.2"]).
 
+-define(STOMP_PROTO_V1_0, 'STOMP 1.0').
+-define(STOMP_PROTO_V1_1, 'STOMP 1.1').
+-define(STOMP_PROTO_V1_2, 'STOMP 1.2').
+
 
 
 -define(INFO_ITEMS,
@@ -30,12 +34,13 @@
          implicit_connect,
          auth_login,
          auth_mechanism,
-         %% peer_addr,
+         peer_addr,
          host,
          port,
          peer_host,
          peer_port,
          protocol,
+         connected_at,
          channels,
          channel_max,
          frame_max,
@@ -63,4 +68,4 @@
          state,
          timeout]).
 
--type send_fun() :: fun ((async | sync, iodata()) -> ok | {atom(), any()}).
+-type send_fun() :: fun ((iodata()) -> ok).

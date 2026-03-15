@@ -18,13 +18,13 @@
 
 -include("rabbit_stomp.hrl").
 -include("rabbit_stomp_frame.hrl").
--include_lib("amqp_client/include/amqp_client.hrl").
 -include_lib("rabbit_common/include/logging.hrl").
 -include_lib("kernel/include/logger.hrl").
 
 
 -record(reader_state, {
     socket,
+    proxy_socket,
     conn_name,
     parse_state,
     processor_state,
@@ -62,52 +62,64 @@ close_connection(Pid, Reason) ->
 
 
 init([SupHelperPid, Ref, Configuration]) ->
-    logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_CONN}),
+    logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_CONN ++ [stomp]}),
     process_flag(trap_exit, true),
     {ok, Sock} = rabbit_networking:handshake(Ref,
         application:get_env(rabbitmq_stomp, proxy_protocol, false)),
     RealSocket = rabbit_net:unwrap_socket(Sock),
+    ProxySocket = rabbit_net:maybe_get_proxy_socket(Sock),
 
     case rabbit_net:connection_string(Sock, inbound) of
         {ok, ConnStr} ->
             ConnName = rabbit_data_coercion:to_binary(ConnStr),
-            ProcInitArgs = processor_args(Configuration, Sock),
-            ProcState = rabbit_stomp_processor:initial_state(Configuration,
-                                                             ProcInitArgs),
+            logger:update_process_metadata(#{connection => ConnName}),
+            case rabbit_net:socket_ends(Sock, inbound) of
+                {ok, {PeerHost, PeerPort, Host, Port}} ->
+                    SSLLoginName = ssl_login_name(RealSocket, Configuration),
+                    SendFun = mk_send_fun(RealSocket),
+                    ProcInitArgs = {SendFun, SSLLoginName, ConnName,
+                                    Host, Port, PeerHost, PeerPort},
+                    ProcState = rabbit_stomp_processor:initial_state(
+                                  Configuration, ProcInitArgs),
 
-            ?LOG_INFO("accepting STOMP connection ~tp (~ts)",
-                [self(), ConnName]),
+                    ?LOG_INFO("accepting STOMP connection ~tp (~ts)",
+                        [self(), ConnName]),
 
-            ParserConfig = #stomp_parser_config{
-                              max_headers        = Configuration#stomp_configuration.max_headers,
-                              max_header_length  = Configuration#stomp_configuration.max_header_length,
-                              max_body_length    = Configuration#stomp_configuration.max_body_length
-                             },
-            ParseState = rabbit_stomp_frame:initial_state(ParserConfig),
-            Alarms = register_resource_alarm(),
+                    ParserConfig = #stomp_parser_config{
+                                      max_headers       = Configuration#stomp_configuration.max_headers,
+                                      max_header_length = Configuration#stomp_configuration.max_header_length,
+                                      max_body_length   = Configuration#stomp_configuration.max_body_length
+                                     },
+                    ParseState = rabbit_stomp_frame:initial_state(ParserConfig),
+                    Alarms = register_resource_alarm(),
 
-            LoginTimeout = application:get_env(rabbitmq_stomp, login_timeout, 10_000),
-            MaxFrameSize = application:get_env(rabbitmq_stomp, max_frame_size, ?DEFAULT_MAX_FRAME_SIZE),
-            erlang:send_after(LoginTimeout, self(), login_timeout),
+                    LoginTimeout = application:get_env(rabbitmq_stomp, login_timeout, 10_000),
+                    MaxFrameSize = application:get_env(rabbitmq_stomp, max_frame_size, ?DEFAULT_MAX_FRAME_SIZE),
+                    erlang:send_after(LoginTimeout, self(), login_timeout),
 
-            rabbit_networking:register_non_amqp_connection(self()),
+                    rabbit_networking:register_non_amqp_connection(self()),
 
-            gen_server2:enter_loop(?MODULE, [],
-              rabbit_event:init_stats_timer(
-                run_socket(control_throttle(
-                  #reader_state{socket             = RealSocket,
-                                conn_name          = ConnName,
-                                parse_state        = ParseState,
-                                parser_config      = ParserConfig,
-                                processor_state    = ProcState,
-                                heartbeat_sup      = SupHelperPid,
-                                heartbeat          = {none, none},
-                                max_frame_size     = MaxFrameSize,
-                                current_frame_size = 0,
-                                state              = running,
-                                blocked_by         = sets:from_list(Alarms, [{version, 2}]),
-                                recv_outstanding   = false})), #reader_state.stats_timer),
-              {backoff, 1000, 1000, 10000});
+                    gen_server2:enter_loop(?MODULE, [],
+                      rabbit_event:init_stats_timer(
+                        run_socket(control_throttle(
+                          #reader_state{socket             = RealSocket,
+                                        proxy_socket       = ProxySocket,
+                                        conn_name          = ConnName,
+                                        parse_state        = ParseState,
+                                        parser_config      = ParserConfig,
+                                        processor_state    = ProcState,
+                                        heartbeat_sup      = SupHelperPid,
+                                        heartbeat          = {none, none},
+                                        max_frame_size     = MaxFrameSize,
+                                        current_frame_size = 0,
+                                        state              = running,
+                                        blocked_by         = sets:from_list(Alarms, [{version, 2}]),
+                                        recv_outstanding   = false})), #reader_state.stats_timer),
+                      {backoff, 1000, 1000, 10000});
+                {error, Reason} ->
+                    rabbit_net:fast_close(RealSocket),
+                    terminate({network_error, {socket_ends, Reason}}, undefined)
+            end;
         {error, enotconn} ->
             rabbit_net:fast_close(RealSocket),
             terminate(shutdown, undefined);
@@ -133,8 +145,13 @@ handle_cast(QueueEvent = {queue_event, _, _}, State) ->
         {ok, NewProcState} ->
             {noreply, processor_state(NewProcState, State), hibernate};
         {error, Reason, NewProcState} ->
-            {stop, Reason, processor_state(NewProcState, State)}
+            {stop, {shutdown, Reason}, processor_state(NewProcState, State)}
     end;
+handle_cast({force_event_refresh, Ref}, State) ->
+    Infos = infos(?INFO_ITEMS ++ ?OTHER_METRICS, State),
+    rabbit_event:notify(connection_created, Infos, Ref),
+    {noreply, rabbit_event:init_stats_timer(State, #reader_state.stats_timer),
+     hibernate};
 handle_cast({close_connection, Reason}, State) ->
     {stop, {shutdown, {server_initiated_close, Reason}}, State};
 handle_cast(client_timeout, State) ->
@@ -146,6 +163,11 @@ handle_info(connection_created, State) ->
     Infos = infos(?INFO_ITEMS ++ ?OTHER_METRICS, State),
     rabbit_core_metrics:connection_created(self(), Infos),
     rabbit_event:notify(connection_created, Infos),
+    ProcState = processor_state(State),
+    logger:update_process_metadata(
+      #{connection => rabbit_stomp_processor:adapter_name(ProcState),
+        vhost => rabbit_stomp_processor:info(vhost, ProcState),
+        user => rabbit_stomp_processor:info(user, ProcState)}),
     {noreply, State, hibernate};
 
 handle_info({Tag, Sock, Data}, State=#reader_state{socket=Sock})
@@ -400,36 +422,15 @@ log_tls_alert(Alert, ConnName) ->
 
 %%----------------------------------------------------------------------------
 
-processor_args(Configuration, Sock) ->
-    RealSocket = rabbit_net:unwrap_socket(Sock),
-    SendFun = fun(IoData) ->
-                      case rabbit_net:send(RealSocket, IoData) of
-                          ok ->
-                              ok;
-                          {error, Reason} ->
-                              exit({send_failed, Reason})
-                      end
-              end,
-    {ok, {PeerAddr, _PeerPort}} = rabbit_net:sockname(RealSocket),
-    {SendFun, adapter_info(Sock),
-     ssl_login_name(RealSocket, Configuration), PeerAddr}.
-
-adapter_info(Sock) ->
-%% case rabbit_net:socket_ends(Socket, inbound) of
-%%         {ok, {PeerIp, PeerPort, Ip, Port}} ->
-%% #amqp_adapter_info{protocol        = {'STOMP', 0},
-%%                        name            = Name,
-%%                        host            = Host,
-%%                        port            = Port,
-%%                        peer_host       = PeerHost,
-%%                        peer_port       = PeerPort,
-%%                        additional_info = maybe_ssl_info(Sock)}
-%%             process_connect(ConnectPacket, Socket, ConnName, SendFun, SocketEnds);
-%%         {error, Reason} ->
-%%             {error, {socket_ends, Reason}}
-%%     end.
-
-    amqp_connection:socket_adapter_info(Sock, {'STOMP', 0}).
+mk_send_fun(RealSocket) ->
+    fun(IoData) ->
+            case rabbit_net:send(RealSocket, IoData) of
+                ok ->
+                    ok;
+                {error, Reason} ->
+                    exit({send_failed, Reason})
+            end
+    end.
 
 ssl_login_name(_Sock, #stomp_configuration{ssl_cert_login = false}) ->
     none;
@@ -453,11 +454,6 @@ maybe_emit_stats(State) ->
     rabbit_event:if_enabled(State, #reader_state.stats_timer,
                             fun() -> emit_stats(State) end).
 
-%% emit_stats(State=#reader_state{connection = C}) when C == none; C == undefined ->
-%%     %% Avoid emitting stats on terminate when the connection has not yet been
-%%     %% established, as this causes orphan entries on the stats database
-%%     State1 = rabbit_event:reset_stats_timer(State, #reader_state.stats_timer),
-%%     ensure_stats_timer(State1);
 emit_stats(State) ->
     [{_, Pid},
      {_, Recv_oct},
@@ -507,9 +503,17 @@ info_internal(conn_name, #reader_state{conn_name = Val}) ->
     rabbit_data_coercion:to_binary(Val);
 info_internal(name, #reader_state{conn_name = Val}) ->
     rabbit_data_coercion:to_binary(Val);
-info_internal(connection, #reader_state{connection = _Val}) ->
+info_internal(connection, _) ->
     self();
 info_internal(connection_state, #reader_state{state = Val}) ->
     Val;
+info_internal(ssl, #reader_state{socket = Sock, proxy_socket = ProxySock}) ->
+    rabbit_net:proxy_ssl_info(Sock, ProxySock) /= nossl;
+info_internal(SSL, #reader_state{socket = Sock, proxy_socket = ProxySock})
+  when SSL =:= ssl_protocol;
+       SSL =:= ssl_key_exchange;
+       SSL =:= ssl_cipher;
+       SSL =:= ssl_hash ->
+    rabbit_ssl:info(SSL, {Sock, ProxySock});
 info_internal(Key, #reader_state{processor_state = ProcState}) ->
     rabbit_stomp_processor:info(Key, ProcState).
