@@ -12,7 +12,7 @@
 
 -include_lib("amqp_client/include/amqp_client.hrl").
 -include("rabbit_stomp_frame.hrl").
--define(DESTINATION, "/queue/bulk-test").
+-define(DESTINATION, <<"/queue/bulk-test">>).
 
 all() ->
     [
@@ -87,7 +87,7 @@ direct_client_connections_are_not_leaked(Config) ->
                           %% send garbage which trips up the parser
                           gen_tcp:send(Socket, ?GARBAGE),
                           rabbit_stomp_client:send(
-                           Client, "LOL", [{"", ""}])
+                           Client, "LOL", [{<<"">>, <<"">>}])
                   end,
                   lists:seq(1, 100)),
     timer:sleep(5000),
@@ -101,8 +101,8 @@ messages_not_dropped_on_disconnect(Config) ->
     N1 = N + 1,
     N1 = count_connections(Config),
     [rabbit_stomp_client:send(
-       Client, 'SEND', [{"destination", ?DESTINATION}],
-       [integer_to_list(Count)]) || Count <- lists:seq(1, 1000)],
+       Client, 'SEND', [{<<"destination">>, ?DESTINATION}],
+       [integer_to_binary(Count)]) || Count <- lists:seq(1, 1000)],
     rabbit_stomp_client:disconnect(Client),
     QName = rabbit_misc:r(<<"/">>, queue, <<"bulk-test">>),
     timer:sleep(3000),
@@ -148,7 +148,7 @@ stats(Config) ->
 heartbeat(Config) ->
     StompPort = get_stomp_port(Config),
     {ok, Client} = rabbit_stomp_client:connect("1.2", "guest", "guest", StompPort,
-                                               [{"heart-beat", "5000,7000"}]),
+                                               [{<<"heart-beat">>, <<"5000,7000">>}]),
     timer:sleep(1000), %% Wait for stats to be emitted, which it does every 100ms
     %% Retrieve the connection Pid
     [Reader] = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_stomp, list, []),
@@ -182,9 +182,9 @@ frame_size(Config) ->
       application, set_env, [rabbitmq_stomp, max_frame_size, 80]),
     StompPort = get_stomp_port(Config),
     {ok, Client} = rabbit_stomp_client:connect("1.2", "guest", "guest", StompPort,
-                                               [{"heart-beat", "5000,7000"}]),
+                                               [{<<"heart-beat">>, <<"5000,7000">>}]),
     ok = rabbit_stomp_client:send(
-      Client, 'SEND', [{"destination", "qwe"}],
+      Client, 'SEND', [{<<"destination">>, <<"qwe">>}],
       ["Lorem ipsum dolor sit amet viverra fusce. "
        "Lorem ipsum dolor sit amet viverra fusce. "
        "Lorem ipsum dolor sit amet viverra fusce."
@@ -201,9 +201,9 @@ frame_size_huge(Config) ->
       application, set_env, [rabbitmq_stomp, max_frame_size, 700]),
     StompPort = get_stomp_port(Config),
     {ok, Client} = rabbit_stomp_client:connect("1.2", "guest", "guest", StompPort,
-                                               [{"heart-beat", "5000,7000"}]),
+                                               [{<<"heart-beat">>, <<"5000,7000">>}]),
     rabbit_stomp_client:send(
-      Client, 'SEND', [{"destination", "qwe"}],
+      Client, 'SEND', [{<<"destination">>, <<"qwe">>}],
       [base64:encode(crypto:strong_rand_bytes(100000000))]),
     {S, _} = Client,
     {error, closed} = gen_tcp:recv(S, 0, 500),

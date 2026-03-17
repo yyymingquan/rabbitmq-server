@@ -50,7 +50,7 @@ parse_simple_frame_crlf(_) ->
     parse_simple_frame_gen("\r\n").
 
 parse_simple_frame_gen(Term) ->
-    Headers = [{"header1", "value1"}, {"header2", "value2"}],
+    Headers = [{<<"header1">>, <<"value1">>}, {<<"header2">>, <<"value2">>}],
     Content = frame_string('CONNECT',
                            Headers,
                            "Body Content",
@@ -106,8 +106,8 @@ parse_resume_mid_header_key(_) ->
     {more, Resume} = parse(First),
     {ok, Frame = #stomp_frame{command = 'CONNECT'}, _Rest} =
         parse(Second, Resume),
-    ?assertEqual({ok, "value1"},
-                 rabbit_stomp_frame:header(Frame, binary_to_list(<<"headꙕr1"/utf8>>))).
+    ?assertEqual({ok, <<"value1">>},
+                 rabbit_stomp_frame:header(Frame, <<"headꙕr1"/utf8>>)).
 
 parse_resume_mid_header_val(_) ->
     First = "CONNECT\nheader1:val",
@@ -115,8 +115,8 @@ parse_resume_mid_header_val(_) ->
     {more, Resume} = parse(First),
     {ok, Frame = #stomp_frame{command = 'CONNECT'}, _Rest} =
         parse(Second, Resume),
-    ?assertEqual({ok, "value1"},
-                 rabbit_stomp_frame:header(Frame, "header1")).
+    ?assertEqual({ok, <<"value1">>},
+                 rabbit_stomp_frame:header(Frame, <<"header1">>)).
 
 parse_resume_mid_body(_) ->
     First = "CONNECT\n\nABC",
@@ -129,14 +129,14 @@ parse_resume_mid_body(_) ->
 parse_no_header_stripping(_) ->
     Content = "CONNECT\nheader: foo \n\n\0",
     {ok, Frame, _} = parse(Content),
-    {ok, Val} = rabbit_stomp_frame:header(Frame, "header"),
-    ?assertEqual(" foo ", Val).
+    {ok, Val} = rabbit_stomp_frame:header(Frame, <<"header">>),
+    ?assertEqual(<<" foo ">>, Val).
 
 parse_multiple_headers(_) ->
     Content = "CONNECT\nheader:correct\nheader:incorrect\n\n\0",
     {ok, Frame, _} = parse(Content),
-    {ok, Val} = rabbit_stomp_frame:header(Frame, "header"),
-    ?assertEqual("correct", Val).
+    {ok, Val} = rabbit_stomp_frame:header(Frame, <<"header">>),
+    ?assertEqual(<<"correct">>, Val).
 
 header_no_colon(_) ->
     Content = "CONNECT\n"
@@ -144,7 +144,7 @@ header_no_colon(_) ->
               "hdrerror\n"
               "hdr2:val2\n"
               "\n\0",
-    ?assertEqual(parse(Content), {error, {header_no_value, "hdrerror"}}).
+    ?assertEqual(parse(Content), {error, {header_no_value, <<"hdrerror">>}}).
 
 no_nested_escapes(_) ->
     Content = "CONNECT\n"      % no escapes
@@ -153,7 +153,7 @@ no_nested_escapes(_) ->
     {ok, Frame, _} = parse(Content),
     ?assertEqual(Frame,
                  #stomp_frame{command = 'CONNECT',
-                              headers = [{"hdr\\rname", "hdr\\rval"}],
+                              headers = [{<<"hdr\\rname">>, <<"hdr\\rval">>}],
                               body_iolist_rev = []}).
 
 header_name_with_cr(_) ->
@@ -169,18 +169,18 @@ header_value_with_colon(_) ->
     {ok, Frame, _} = parse(Content),
     ?assertEqual(Frame,
                  #stomp_frame{ command     = 'CONNECT',
-                               headers     = [{"header", "val:ue"}],
+                               headers     = [{<<"header">>, <<"val:ue">>}],
                                body_iolist_rev = []}).
 
 stream_offset_header(_) ->
     TestCases = [
-        {{"x-stream-offset", "first"}, {longstr, <<"first">>}},
-        {{"x-stream-offset", "last"}, {longstr, <<"last">>}},
-        {{"x-stream-offset", "next"}, {longstr, <<"next">>}},
-        {{"x-stream-offset", "offset=5000"}, {long, 5000}},
-        {{"x-stream-offset", "timestamp=1000"}, {timestamp, 1000}},
-        {{"x-stream-offset", "foo"}, not_found},
-        {{"some-header", "some value"}, not_found}
+        {{<<"x-stream-offset">>, <<"first">>}, {longstr, <<"first">>}},
+        {{<<"x-stream-offset">>, <<"last">>}, {longstr, <<"last">>}},
+        {{<<"x-stream-offset">>, <<"next">>}, {longstr, <<"next">>}},
+        {{<<"x-stream-offset">>, <<"offset=5000">>}, {long, 5000}},
+        {{<<"x-stream-offset">>, <<"timestamp=1000">>}, {timestamp, 1000}},
+        {{<<"x-stream-offset">>, <<"foo">>}, not_found},
+        {{<<"some-header">>, <<"some value">>}, not_found}
     ],
 
     lists:foreach(fun({Header, Expected}) ->
@@ -192,13 +192,13 @@ stream_offset_header(_) ->
 
 stream_filter_header(_) ->
     TestCases = [
-        {{"x-stream-filter", "banana"}, {array, [{longstr, <<"banana">>}]}},
-        {{"x-stream-filter", "banana,apple"}, {array, [{longstr, <<"banana">>},
+        {{<<"x-stream-filter">>, <<"banana">>}, {array, [{longstr, <<"banana">>}]}},
+        {{<<"x-stream-filter">>, <<"banana,apple">>}, {array, [{longstr, <<"banana">>},
                                                        {longstr, <<"apple">>}]}},
-         {{"x-stream-filter", "banana,apple,orange"}, {array, [{longstr, <<"banana">>},
+         {{<<"x-stream-filter">>, <<"banana,apple,orange">>}, {array, [{longstr, <<"banana">>},
                                                                {longstr, <<"apple">>},
                                                                {longstr, <<"orange">>}]}},
-        {{"some-header", "some value"}, not_found}
+        {{<<"some-header">>, <<"some value">>}, not_found}
     ],
 
     lists:foreach(fun({Header, Expected}) ->
@@ -210,8 +210,8 @@ stream_filter_header(_) ->
 
 test_frame_serialization(Expected, TrailingLF) ->
     {ok, Frame, _} = parse(Expected),
-    {ok, Val} = rabbit_stomp_frame:header(Frame, "head\r:\ner"),
-    ?assertEqual(":\n\r\\", Val),
+    {ok, Val} = rabbit_stomp_frame:header(Frame, <<"head\r:\ner">>),
+    ?assertEqual(<<":\n\r\\">>, Val),
     Serialized = lists:flatten(rabbit_stomp_frame:serialize(Frame, TrailingLF)),
     ?assertEqual(Expected, rabbit_misc:format("~ts", [Serialized])).
 
@@ -232,6 +232,5 @@ parse_complete(Content) ->
 
 frame_string(Command, Headers, BodyContent, Term) ->
     HeaderString =
-        lists:flatten([Key ++ ":" ++ Value ++ Term || {Key, Value} <- Headers]),
+        lists:flatten([binary_to_list(Key) ++ ":" ++ binary_to_list(Value) ++ Term || {Key, Value} <- Headers]),
     atom_to_list(Command) ++ Term ++ HeaderString ++ Term ++ BodyContent ++ "\0" ++ "\n".
-

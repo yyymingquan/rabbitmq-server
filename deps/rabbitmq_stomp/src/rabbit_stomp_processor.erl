@@ -92,9 +92,9 @@
          user              :: undefined | #user{},
          authz_ctx         :: undefined | map(),
          subscriptions     :: subscriptions(),
-         pending_receipts  :: gb_trees:tree(integer(), string()),
+         pending_receipts  :: gb_trees:tree(integer(), binary()),
          route_state       :: sets:set(),
-         reply_queues      :: #{string() => binary()},
+         reply_queues      :: #{binary() => binary()},
          confirmed         :: [rabbit_confirms:mx()],
          rejected          :: [rabbit_confirms:mx()],
          unconfirmed       :: rabbit_confirms:state(),
@@ -332,7 +332,7 @@ process_connect(Implicit, Frame,
                   {Auth, {Username, _}} = Creds = creds(Frame1, SSLLoginName, Config),
                   {ok, DefaultVHost} = application:get_env(rabbitmq_stomp, default_vhost),
                   VHost = login_header(Frame1, ?HEADER_HOST, DefaultVHost),
-                  Heartbeat = login_header(Frame1, ?HEADER_HEART_BEAT, "0,0"),
+                  Heartbeat = login_header(Frame1, ?HEADER_HEART_BEAT, <<"0,0">>),
                   StateN1 = StateN#state{cfg = Config#cfg{vhost = VHost,
                                                           proto_ver = ProtoVer,
                                                           frame_transformer = FT,
@@ -353,17 +353,18 @@ process_connect(Implicit, Frame,
                   SessionId = rabbit_guid:string(rabbit_guid:gen_secure(), "session"),
                   {SendTimeout, ReceiveTimeout} = ensure_heartbeats(Heartbeat),
 
-                  Headers = [{?HEADER_SESSION, SessionId},
+                  Headers = [{?HEADER_SESSION, list_to_binary(SessionId)},
                              {?HEADER_HEART_BEAT,
-                              io_lib:format("~B,~B", [SendTimeout, ReceiveTimeout])},
-                             {?HEADER_VERSION, Version}],
+                              <<(integer_to_binary(SendTimeout))/binary, $,,
+                                (integer_to_binary(ReceiveTimeout))/binary>>},
+                             {?HEADER_VERSION, list_to_binary(Version)}],
 
                   Res = ok("CONNECTED",
                            case application:get_env(rabbitmq_stomp, hide_server_info, false) of
                                true  -> Headers;
-                               false -> [{?HEADER_SERVER, server_header()} | Headers]
+                               false -> [{?HEADER_SERVER, iolist_to_binary(server_header())} | Headers]
                            end,
-                           "",
+                           [],
                            StateN1#state{cfg = StateN1#state.cfg#cfg{
                                                                session_id  = SessionId,
                                                                version     = Version,
@@ -437,13 +438,10 @@ auth_props_for_creds(Creds, #state{cfg = #cfg{
                                                    {vhost, VHost}]}
     end.
 
-login_header(Frame, Key, Default) when is_binary(Default) ->
-    login_header(Frame, Key, binary_to_list(Default));
+login_header(Frame, Key, Default) when is_list(Default) ->
+    login_header(Frame, Key, list_to_binary(Default));
 login_header(Frame, Key, Default) ->
-    case rabbit_stomp_frame:header(Frame, Key, Default) of
-        undefined -> undefined;
-        Hdr       -> list_to_binary(Hdr)
-    end.
+    rabbit_stomp_frame:header(Frame, Key, Default).
 
 %%----------------------------------------------------------------------------
 %% Frame Transformation
@@ -464,9 +462,9 @@ validate_frame(Command, Frame, State)
   when Command =:= 'SUBSCRIBE' orelse Command =:= 'UNSUBSCRIBE' ->
     Hdr = fun(Name) -> rabbit_stomp_frame:header(Frame, Name) end,
     case {Hdr(?HEADER_DURABLE), Hdr(?HEADER_PERSISTENT), Hdr(?HEADER_ID)} of
-        {{ok, "true"}, _, not_found} ->
+        {{ok, <<"true">>}, _, not_found} ->
             report_missing_id_header(State);
-        {_, {ok, "true"}, not_found} ->
+        {_, {ok, <<"true">>}, not_found} ->
             report_missing_id_header(State);
         _ ->
             ok(State)
@@ -545,7 +543,7 @@ ack_action(Command, Frame,
                 {ok, {ConsumerTag, _SessionId, DeliveryTag}} ->
                     case maps:find(ConsumerTag, Subs) of
                         {ok, Sub} ->
-                            Requeue = rabbit_stomp_frame:boolean_header(Frame, "requeue", DefaultNackRequeue),
+                            Requeue = rabbit_stomp_frame:boolean_header(Frame, <<"requeue">>, DefaultNackRequeue),
                             State1 = Fun(DeliveryTag, Sub, Requeue, State),
                             ok(State1);
                         error ->
@@ -581,7 +579,7 @@ server_cancel_consumer(ConsumerTag, State = #state{subscriptions = Subs}) ->
         {ok, Subscription = #subscription{description = Description}} ->
             Id = case rabbit_stomp_util:tag_to_id(ConsumerTag) of
                      {ok,    {_, Id1}} -> Id1;
-                     {error, {_, Id1}} -> "Unknown[" ++ Id1 ++ "]"
+                     {error, {_, Id1}} -> <<"Unknown[", Id1/binary, "]">>
                  end,
             _ = send_error_frame("Server cancelled subscription",
                                  [{?HEADER_SUBSCRIPTION, Id}],
@@ -689,7 +687,7 @@ maybe_delete_durable_sub_queue({topic, Name}, Frame,
         true ->
             {ok, Id} = rabbit_stomp_frame:header(Frame, ?HEADER_ID),
             QName = rabbit_stomp_util:subscription_queue_name(Name, Id, Frame),
-            QRes = rabbit_misc:r(VHost, queue, list_to_binary(QName)),
+            QRes = rabbit_misc:r(VHost, queue, QName),
             delete_queue(QRes, Username),
             ok(State);
         false ->
@@ -729,7 +727,7 @@ with_destination(Command, Frame, State, Fun) ->
                           "'~ts' is not a valid destination.~n"
                           "Valid destination types are: ~ts.~n",
                           [Content,
-                           string:join(?ALL_DEST_PREFIXES, ", ")], State)
+                           lists:join(<<", ">>, ?ALL_DEST_PREFIXES)], State)
             end;
         not_found ->
             error("Missing destination",
@@ -838,7 +836,7 @@ subscribe_argument(?HEADER_X_STREAM_OFFSET, Frame, Acc) ->
         not_found ->
             Acc;
         {OffsetType, OffsetValue} ->
-            [{list_to_binary(?HEADER_X_STREAM_OFFSET), OffsetType, OffsetValue}] ++ Acc
+            [{?HEADER_X_STREAM_OFFSET, OffsetType, OffsetValue}] ++ Acc
     end;
 subscribe_argument(?HEADER_X_STREAM_FILTER, Frame, Acc) ->
     StreamFilter = rabbit_stomp_frame:stream_filter_header(Frame),
@@ -846,13 +844,13 @@ subscribe_argument(?HEADER_X_STREAM_FILTER, Frame, Acc) ->
         not_found ->
             Acc;
         {FilterType, FilterValue} ->
-            [{list_to_binary(?HEADER_X_STREAM_FILTER), FilterType, FilterValue}] ++ Acc
+            [{?HEADER_X_STREAM_FILTER, FilterType, FilterValue}] ++ Acc
     end;
 subscribe_argument(?HEADER_X_STREAM_MATCH_UNFILTERED, Frame, Acc) ->
     MatchUnfiltered = rabbit_stomp_frame:boolean_header(Frame, ?HEADER_X_STREAM_MATCH_UNFILTERED),
     case MatchUnfiltered of
         {ok, MU} ->
-            [{list_to_binary(?HEADER_X_STREAM_MATCH_UNFILTERED), bool, MU}] ++ Acc;
+            [{?HEADER_X_STREAM_MATCH_UNFILTERED, bool, MU}] ++ Acc;
         not_found ->
             Acc
     end;
@@ -860,7 +858,7 @@ subscribe_argument(?HEADER_X_PRIORITY, Frame, Acc) ->
     Priority = rabbit_stomp_frame:integer_header(Frame, ?HEADER_X_PRIORITY),
     case Priority of
         {ok, P} ->
-            [{list_to_binary(?HEADER_X_PRIORITY), byte, P}] ++ Acc;
+            [{?HEADER_X_PRIORITY, byte, P}] ++ Acc;
         not_found ->
             Acc
     end.
@@ -910,12 +908,11 @@ do_send(Destination, _DestHdr,
 
             Props = rabbit_stomp_util:message_properties(Frame1),
 
-            {ExchangeNameList, RoutingKeyList} = parse_routing(Destination, DfltTopicEx),
-            RoutingKey = list_to_binary(RoutingKeyList),
+            {Exchange0, RoutingKey} = parse_routing(Destination, DfltTopicEx),
 
             rabbit_global_counters:messages_received(ProtoVer, 1),
 
-            ExchangeName = rabbit_misc:r(VHost, exchange, list_to_binary(ExchangeNameList)),
+            ExchangeName = rabbit_misc:r(VHost, exchange, Exchange0),
             check_resource_access(User, ExchangeName, write, AuthzCtx),
             Exchange = rabbit_exchange:lookup_or_die(ExchangeName),
             check_internal_exchange(Exchange),
@@ -1146,8 +1143,8 @@ internal_reject(Requeue, Acked,
 
 negotiate_version(Frame) ->
     ClientVers = re:split(rabbit_stomp_frame:header(
-                            Frame, ?HEADER_ACCEPT_VERSION, "1.0"),
-                          ",", [{return, list}]),
+                            Frame, ?HEADER_ACCEPT_VERSION, <<"1.0">>),
+                          <<",">>, [{return, list}]),
     rabbit_stomp_util:negotiate_version(ClientVers, ?SUPPORTED_VERSIONS).
 
 
@@ -1269,30 +1266,28 @@ ensure_reply_queue(TempQueueId, State = #state{reply_queues  = RQS,
                                                     subscriptions = Subs}) ->
     case maps:find(TempQueueId, RQS) of
         {ok, RQ} ->
-            {binary_to_list(RQ), State};
+            {RQ, State};
         error ->
             {ok, Queue} = create_queue(State),
             #resource{name = QNameBin} = QName = amqqueue:get_name(Queue),
 
             ConsumerTag = rabbit_stomp_util:consumer_tag_reply_to(TempQueueId),
 
-
-    {ok, {_Global, DefaultPrefetch}} = application:get_env(rabbit, default_consumer_prefetch),
+            {ok, {_Global, DefaultPrefetch}} = application:get_env(rabbit, default_consumer_prefetch),
             Spec = #{no_ack => true,
                      mode => {simple_prefetch, DefaultPrefetch},
                      consumer_tag => ConsumerTag,
                      exclusive_consume => false,
                      args => []},
             {ok, State1} = consume_queue(QName, Spec, State),
-            Destination = binary_to_list(QNameBin),
 
             %% synthesise a subscription to the reply queue destination
             Subs1 = maps:put(ConsumerTag,
-                             #subscription{dest_hdr  = Destination,
+                             #subscription{dest_hdr  = QNameBin,
                                            multi_ack = false},
                              Subs),
 
-            {Destination, State1#state{
+            {QNameBin, State1#state{
                             reply_queues  = maps:put(TempQueueId, QNameBin, RQS),
                             subscriptions = Subs1}}
     end.
@@ -1311,7 +1306,7 @@ do_receipt('SEND', _, State) ->
     %% SEND frame receipts are handled when messages are confirmed
     State;
 do_receipt(_Frame, ReceiptId, State) ->
-    send_frame('RECEIPT', [{"receipt-id", ReceiptId}], "", State).
+    send_frame('RECEIPT', [{<<"receipt-id">>, ReceiptId}], <<>>, State).
 
 record_receipt(_DoConfirm = true, MsgSeqNo, ReceiptId, State = #state{pending_receipts = PR}) ->
     State#state{pending_receipts = gb_trees:insert(MsgSeqNo, ReceiptId, PR)}.
@@ -1437,8 +1432,8 @@ perform_transaction_action({Frame, Fun}, {ok, State}) ->
 
 ensure_heartbeats(Heartbeats) ->
 
-    [CX, CY] = [list_to_integer(X) ||
-                   X <- re:split(Heartbeats, ",", [{return, list}])],
+    [CX, CY] = [binary_to_integer(X) ||
+                   X <- binary:split(Heartbeats, <<",">>)],
 
     {SendTimeout, ReceiveTimeout} =
         {millis_to_seconds(CY), millis_to_seconds(CX)},
@@ -1454,7 +1449,7 @@ millis_to_seconds(M)               -> M div 1000.
 %% Queue Setup
 %%----------------------------------------------------------------------------
 
-ensure_endpoint(_Direction, {queue, []}, _Frame, _State) ->
+ensure_endpoint(_Direction, {queue, <<>>}, _Frame, _State) ->
     {error, {invalid_destination, "Destination cannot be blank"}};
 
 ensure_endpoint(source, EndPoint, {_, _, Headers, _} = Frame, State) ->
@@ -1465,7 +1460,7 @@ ensure_endpoint(source, EndPoint, {_, _, Headers, _} = Frame, State) ->
                                                 % Note: we discard the exchange here so there's no need to use
                                                 % the default_topic_exchange configuration key
                   {_, Name} = parse_routing(EndPoint),
-                  list_to_binary(rabbit_stomp_util:subscription_queue_name(Name, Id, Frame))
+                  rabbit_stomp_util:subscription_queue_name(Name, Id, Frame)
           end
          }] ++ rabbit_stomp_util:build_params(EndPoint, Headers),
     Arguments = rabbit_stomp_util:build_arguments(Headers),
@@ -1548,9 +1543,9 @@ send_error_frame(Message, ExtraHeaders, Format, Args, State) ->
                      State).
 
 send_error_frame(Message, ExtraHeaders, Detail, State) ->
-    send_frame('ERROR', [{"message", Message},
-                         {"content-type", "text/plain"},
-                         {"version", string:join(?SUPPORTED_VERSIONS, ",")}] ++
+    send_frame('ERROR', [{<<"message">>, iolist_to_binary(Message)},
+                         {<<"content-type">>, <<"text/plain">>},
+                         {<<"version">>, iolist_to_binary(string:join(?SUPPORTED_VERSIONS, ","))}] ++
                    ExtraHeaders,
                iolist_to_binary(Detail), State).
 
@@ -1565,14 +1560,14 @@ parse_routing(Destination, DefaultTopicExchange) ->
     Exchange1 = maybe_apply_default_topic_exchange(Exchange0, DefaultTopicExchange),
     {Exchange1, RoutingKey}.
 
-maybe_apply_default_topic_exchange("amq.topic"=Exchange, <<"amq.topic">>=_DefaultTopicExchange) ->
+maybe_apply_default_topic_exchange(<<"amq.topic">>=Exchange, <<"amq.topic">>=_DefaultTopicExchange) ->
     %% This is the case where the destination is the same
     %% as the default of amq.topic
     Exchange;
-maybe_apply_default_topic_exchange("amq.topic"=_Exchange, DefaultTopicExchange) ->
+maybe_apply_default_topic_exchange(<<"amq.topic">>=_Exchange, DefaultTopicExchange) ->
     %% This is the case where the destination would have been
     %% amq.topic but we have configured a different default
-    binary_to_list(DefaultTopicExchange);
+    DefaultTopicExchange;
 maybe_apply_default_topic_exchange(Exchange, _DefaultTopicExchange) ->
     %% This is the case where the destination is different than
     %% amq.topic, so it must have been specified in the
@@ -1628,17 +1623,16 @@ delete_queue(QRes, Username) ->
             ok
     end.
 
-ensure_binding(#resource{name = QueueBin}, {"", Queue}, _State) ->
+ensure_binding(#resource{name = QueueBin}, {<<>>, QueueBin}, _State) ->
     %% i.e., we should only be asked to bind to the default exchange a
     %% queue with its own name
-    QueueBin = list_to_binary(Queue),
     ok;
 ensure_binding(QName, {Exchange, RoutingKey}, _State = #state{cfg = #cfg{
                                                                        auth_login = Username,
                                                                        vhost = VHost}}) ->
-    Binding = #binding{source = rabbit_misc:r(VHost, exchange, list_to_binary(Exchange)),
+    Binding = #binding{source = rabbit_misc:r(VHost, exchange, Exchange),
                        destination = QName,
-                       key = list_to_binary(RoutingKey)},
+                       key = RoutingKey},
     case rabbit_binding:add(Binding, Username) of
         {error, {resources_missing, [{not_found, Name} | _]}} ->
             rabbit_amqqueue:not_found(Name);
@@ -1743,31 +1737,32 @@ handle_queue_actions(Actions, #state{} = State0) ->
 
 
 parse_endpoint(undefined) ->
-    parse_endpoint("/queue");
+    parse_endpoint(<<"/queue">>);
 parse_endpoint(Destination) when is_binary(Destination) ->
-    parse_endpoint(unicode:characters_to_list(Destination));
-parse_endpoint(Destination) when is_list(Destination) ->
-    case string:split(Destination, "/", all) of
+    case binary:split(Destination, <<"/">>, [global]) of
         [Name] ->
             {ok, {queue, unescape(Name)}};
-        ["", "exchange" | Rest] ->
+        [<<>>, <<"exchange">> | Rest] ->
             parse_endpoint0(exchange, Rest);
-        ["", "queue" | Rest] ->
+        [<<>>, <<"queue">> | Rest] ->
             parse_endpoint0(queue, Rest);
-        ["", "topic" | Rest] ->
+        [<<>>, <<"topic">> | Rest] ->
             parse_endpoint0(topic, Rest);
-        ["", "temp-queue" | Rest] ->
+        [<<>>, <<"temp-queue">> | Rest] ->
             parse_endpoint0(temp_queue, Rest);
-        ["", "amq", "queue" | Rest] ->
+        [<<>>, <<"amq">>, <<"queue">> | Rest] ->
             parse_endpoint0(amqqueue, Rest);
-        ["", "reply-queue" = Prefix | [_|_]] ->
+        [<<>>, <<"reply-queue">> | [_|_]] ->
+            %% Reply queue names can have slashes, so take everything
+            %% after "/reply-queue/"
+            PrefixLen = byte_size(<<"/reply-queue/">>),
             parse_endpoint0(reply_queue,
-                            [lists:nthtail(2 + length(Prefix), Destination)]);
+                            [binary:part(Destination, PrefixLen, byte_size(Destination) - PrefixLen)]);
         _ ->
             {error, {unknown_destination, Destination}}
     end.
 
-parse_endpoint0(exchange, ["" | _] = Rest) ->
+parse_endpoint0(exchange, [<<>> | _] = Rest) ->
     {error, {invalid_destination, exchange, to_url(Rest)}};
 parse_endpoint0(exchange, [Name]) ->
     {ok, {exchange, {unescape(Name), undefined}}};
@@ -1775,7 +1770,7 @@ parse_endpoint0(exchange, [Name, Pattern]) ->
     {ok, {exchange, {unescape(Name), unescape(Pattern)}}};
 parse_endpoint0(queue,    []) ->
     {error, {invalid_destination, queue, []}};
-parse_endpoint0(Type,     [[_|_]] = [Name]) ->
+parse_endpoint0(Type,     [Name]) when Name =/= <<>> ->
     {ok, {Type, unescape(Name)}};
 parse_endpoint0(Type,     Rest) ->
     {error, {invalid_destination, Type, to_url(Rest)}}.
@@ -1800,7 +1795,7 @@ util_ensure_endpoint(_Dir, {queue, undefined}, _Params, State) ->
 util_ensure_endpoint(_, {queue, Name}, Params, State=#state{route_state = RoutingState,
                                                             cfg = #cfg{vhost = VHost}}) ->
     Params1 = rabbit_misc:pmerge(durable, true, Params),
-    QueueNameBin = list_to_binary(Name),
+    QueueNameBin = Name,
     RState1 = case sets:is_element(QueueNameBin, RoutingState) of
                   true -> RoutingState;
                   _    -> Amqqueue = new_amqqueue(QueueNameBin, queue, Params1, State),
@@ -1819,10 +1814,10 @@ util_ensure_endpoint(dest, {topic, _}, _Params, State) ->
     {ok, undefined, State};
 
 util_ensure_endpoint(_, {amqqueue, Name}, _Params, State = #state{cfg = #cfg{vhost = VHost}}) ->
-    {ok, rabbit_misc:r(VHost, queue, list_to_binary(Name)), State};
+    {ok, rabbit_misc:r(VHost, queue, Name), State};
 
 util_ensure_endpoint(_, {reply_queue, Name}, _Params, State = #state{cfg = #cfg{vhost = VHost}}) ->
-    {ok, rabbit_misc:r(VHost, queue, list_to_binary(Name)), State};
+    {ok, rabbit_misc:r(VHost, queue, Name), State};
 
 util_ensure_endpoint(_Direction, _Endpoint, _Params, _State) ->
     {error, invalid_endpoint}.
@@ -1831,14 +1826,14 @@ util_ensure_endpoint(_Direction, _Endpoint, _Params, _State) ->
 %% --------------------------------------------------------------------------
 
 parse_routing({exchange, {Name, undefined}}) ->
-    {Name, ""};
+    {Name, <<>>};
 parse_routing({exchange, {Name, Pattern}}) ->
     {Name, Pattern};
 parse_routing({topic, Name}) ->
-    {"amq.topic", Name};
+    {<<"amq.topic">>, Name};
 parse_routing({Type, Name})
   when Type =:= queue orelse Type =:= reply_queue orelse Type =:= amqqueue ->
-    {"", Name}.
+    {<<>>, Name}.
 
 dest_temp_queue({temp_queue, Name}) -> Name;
 dest_temp_queue(_)                  -> none.
@@ -1883,14 +1878,14 @@ new_amqqueue(QNameBin0, Type, Params0, _State = #state{user = #user{username = U
                  rabbit_amqqueue:get_queue_type(Args)).
 
 
-to_url([])  -> [];
-to_url(Lol) -> "/" ++ string:join(Lol, "/").
+to_url([])  -> <<>>;
+to_url(Lol) -> iolist_to_binary([$/ | lists:join($/, Lol)]).
 
-unescape(Str) -> unescape(Str, []).
+unescape(Bin) -> unescape(Bin, []).
 
-unescape("%2F" ++ Str, Acc) -> unescape(Str, [$/ | Acc]);
-unescape([C | Str],    Acc) -> unescape(Str, [C | Acc]);
-unescape([],           Acc) -> lists:reverse(Acc).
+unescape(<<>>, Acc) -> list_to_binary(lists:reverse(Acc));
+unescape(<<"%2F", Rest/binary>>, Acc) -> unescape(Rest, [$/ | Acc]);
+unescape(<<C, Rest/binary>>, Acc) -> unescape(Rest, [C | Acc]).
 
 
 consume_queue(QRes, Spec0, State = #state{user = #user{username = Username} = User,

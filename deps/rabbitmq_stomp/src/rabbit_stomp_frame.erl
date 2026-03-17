@@ -96,8 +96,8 @@ initial_state(Config) -> {none, Config}.
 -record(ps, {acc     = [] :: [byte()],
              acc_len = 0  :: non_neg_integer(),
              cmd          :: atom() | binary() | undefined,
-             hdrs    = [] :: [{string(), string()}],
-             hdrname      :: string() | undefined,
+             hdrs    = [] :: [{binary(), binary()}],
+             hdrname      :: binary() | undefined,
              config       :: #stomp_parser_config{}}).
 
 %%
@@ -173,15 +173,13 @@ parse_hdr(Bin, S = #ps{config = #stomp_parser_config{max_header_length = MaxHL}}
             case byte_size(Name) > MaxHL orelse byte_size(Value) > MaxHL of
                 true  -> {error, {max_header_length, MaxHL}};
                 false ->
-                    Hdrs = insert_header(S#ps.hdrs,
-                                         binary_to_list(Name),
-                                         binary_to_list(Value)),
+                    Hdrs = insert_header(S#ps.hdrs, Name, Value),
                     parse_headers(Rest, S#ps{hdrs = Hdrs})
             end;
         has_escapes ->
             parse_hdrname_esc(Bin, S#ps{acc = [], acc_len = 0});
         {no_value, Name} ->
-            {error, {header_no_value, binary_to_list(Name)}};
+            {error, {header_no_value, Name}};
         {more, Len} ->
             case Len > MaxHL of
                 true  -> {error, {max_header_length, MaxHL}};
@@ -197,14 +195,14 @@ parse_hdrname_esc(<<>>, S) ->
 parse_hdrname_esc(<<?CR>>, S) ->
     more(fun(Rest) -> parse_hdrname_esc(<<?CR, Rest/binary>>, S) end);
 parse_hdrname_esc(<<?CR, ?LF, _/binary>>, #ps{acc = Acc}) ->
-    {error, {header_no_value, lists:reverse(Acc)}};
+    {error, {header_no_value, list_to_binary(lists:reverse(Acc))}};
 parse_hdrname_esc(<<?CR, Ch:8, _/binary>>, _) ->
     {error, {unexpected_chars_in_header, [?CR, Ch]}};
 parse_hdrname_esc(<<?LF, _/binary>>, #ps{acc = Acc}) ->
-    {error, {header_no_value, lists:reverse(Acc)}};
+    {error, {header_no_value, list_to_binary(lists:reverse(Acc))}};
 parse_hdrname_esc(<<?COLON, Rest/binary>>, S = #ps{acc = Acc}) ->
     parse_hdrvalue_esc(Rest, S#ps{acc = [], acc_len = 0,
-                                  hdrname = lists:reverse(Acc)});
+                                  hdrname = list_to_binary(lists:reverse(Acc))});
 parse_hdrname_esc(<<?BSL>>, S) ->
     more(fun(Rest) -> parse_hdrname_esc(<<?BSL, Rest/binary>>, S) end);
 parse_hdrname_esc(<<?BSL, Ch:8, Rest/binary>>, S) ->
@@ -241,7 +239,7 @@ parse_hdrvalue_esc(<<Ch:8, Rest/binary>>, S = #ps{acc_len = Len,
     end.
 
 finish_hdr_esc(Rest, #ps{acc = Acc, hdrs = Hdrs, hdrname = HdrName} = S) ->
-    Hdrs1 = insert_header(Hdrs, HdrName, lists:reverse(Acc)),
+    Hdrs1 = insert_header(Hdrs, HdrName, list_to_binary(lists:reverse(Acc))),
     parse_headers(Rest, S#ps{hdrs = Hdrs1}).
 
 %%
@@ -427,18 +425,18 @@ header(F, K, D) -> default_value(header(F, K), D).
 
 boolean_header(#stomp_frame{headers = Headers}, Key) ->
     case lists:keysearch(Key, 1, Headers) of
-        {value, {_, "true"}}  -> {ok, true};
-        {value, {_, "false"}} -> {ok, false};
-        {value, {_, "True"}}  -> {ok, true};
-        {value, {_, "False"}} -> {ok, false};
-        _                     -> not_found
+        {value, {_, <<"true">>}}  -> {ok, true};
+        {value, {_, <<"false">>}} -> {ok, false};
+        {value, {_, <<"True">>}}  -> {ok, true};
+        {value, {_, <<"False">>}} -> {ok, false};
+        _                         -> not_found
     end.
 
 boolean_header(F, K, D) -> default_value(boolean_header(F, K), D).
 
 internal_integer_header(Headers, Key) ->
     case lists:keysearch(Key, 1, Headers) of
-        {value, {_, Str}} -> {ok, list_to_integer(string:strip(Str))};
+        {value, {_, Str}} -> {ok, binary_to_integer(string:trim(Str))};
         _                 -> not_found
     end.
 
@@ -447,11 +445,7 @@ integer_header(#stomp_frame{headers = Headers}, Key) ->
 
 integer_header(F, K, D) -> default_value(integer_header(F, K), D).
 
-binary_header(F, K) ->
-    case header(F, K) of
-        {ok, Str} -> {ok, list_to_binary(Str)};
-        not_found -> not_found
-    end.
+binary_header(F, K) -> header(F, K).
 
 binary_header(F, K, D) -> default_value(binary_header(F, K), D).
 
@@ -495,7 +489,7 @@ serialize(#stomp_frame{command = Command,
      lists:map(fun serialize_header/1,
                lists:keydelete(?HEADER_CONTENT_LENGTH, 1, Headers)),
      if
-         Len > 0 -> [?HEADER_CONTENT_LENGTH ++ ":", integer_to_list(Len), ?LF];
+         Len > 0 -> [?HEADER_CONTENT_LENGTH, ?COLON, integer_to_list(Len), ?LF];
          true    -> []
      end,
      ?LF, case BodyFragments of
@@ -509,17 +503,18 @@ serialize_command(Command) -> Command.
 
 serialize_header({K, V}) when is_integer(V) -> hdr(escape(K), integer_to_list(V));
 serialize_header({K, V}) when is_boolean(V) -> hdr(escape(K), boolean_to_list(V));
-serialize_header({K, V}) when is_list(V)    -> hdr(escape(K), escape(V)).
+serialize_header({K, V}) when is_binary(V)  -> hdr(escape(K), escape(V)).
 
 boolean_to_list(true) -> "true";
 boolean_to_list(_)    -> "false".
 
 hdr(K, V) -> [K, ?COLON, V, ?LF].
 
-escape(Str) -> [escape1(Ch) || Ch <- Str].
+escape(Bin) -> escape(Bin, []).
 
-escape1(?COLON) -> [?BSL, ?COLON_ESC];
-escape1(?BSL)   -> [?BSL, ?BSL_ESC];
-escape1(?LF)    -> [?BSL, ?LF_ESC];
-escape1(?CR)    -> [?BSL, ?CR_ESC];
-escape1(Ch)     -> Ch.
+escape(<<>>, Acc) -> lists:reverse(Acc);
+escape(<<?COLON, Rest/binary>>, Acc) -> escape(Rest, [?COLON_ESC, ?BSL | Acc]);
+escape(<<?BSL, Rest/binary>>, Acc) -> escape(Rest, [?BSL_ESC, ?BSL | Acc]);
+escape(<<?LF, Rest/binary>>, Acc) -> escape(Rest, [?LF_ESC, ?BSL | Acc]);
+escape(<<?CR, Rest/binary>>, Acc) -> escape(Rest, [?CR_ESC, ?BSL | Acc]);
+escape(<<Ch:8, Rest/binary>>, Acc) -> escape(Rest, [Ch | Acc]).
