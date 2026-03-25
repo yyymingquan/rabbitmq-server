@@ -20,7 +20,16 @@
 -export([
          begin_default/0,
          begin_default/1,
-         begin_chaos/1
+         begin_quorum_chaos/0,
+         begin_quorum_chaos/1,
+         begin_coordination_chaos/0,
+         begin_coordination_chaos/1,
+         begin_delayed_chaos/0,
+         begin_delayed_chaos/1,
+         begin_jms_chaos/0,
+         begin_jms_chaos/1,
+         begin_chaos/1,
+         stop/0
         ]).
 
 
@@ -40,12 +49,13 @@
                          non_neg_integer(), [chaos_event()]}
                        }.
 
--type chaos_cfg() :: #{ra_system => atom(),
+-type chaos_cfg() :: #{ra_systems := [atom()],
                        interval := non_neg_integer(),
                        events := [chaos_event()]}.
 -define(SERVER, ?MODULE).
 
--record(?MODULE, {cfg :: chaos_cfg()}).
+-record(?MODULE, {cfg :: chaos_cfg(),
+                  timer_ref :: undefined | reference()}).
 
 -export_type([chaos_cfg/0,
               chaos_event/0]).
@@ -55,24 +65,44 @@
 %% inside the broker.
 %%----------------------------------------------------------------------------
 
+-define(ALL_SYSTEMS, [quorum_queues, coordination, delayed_queues, jms_queues]).
+-define(DEFAULT_INTERVAL, 20000).
+
 begin_default() ->
-    begin_default(20000).
+    begin_default(?DEFAULT_INTERVAL).
 
 begin_default(Interval) ->
-    Events = [
-              {kill_qq_wal, 1, {kill_named_proc, ra_log_wal, chaos}},
-              {kill_qq_seg_writer, 1,
-               {kill_named_proc, ra_log_segment_writer, kill}},
-              {kill_qq_member, 2, {kill_ra_member, chaos}},
-              {restart_qq_member, 2, restart_ra_member},
-              {flood_a_node, 2, flood_node}
-             ],
-    begin_chaos(#{ra_system => quorum_queues,
-                  interval => Interval,
-                  events => Events}).
+    begin_for_systems(?ALL_SYSTEMS, Interval).
+
+begin_quorum_chaos() ->
+    begin_quorum_chaos(?DEFAULT_INTERVAL).
+
+begin_quorum_chaos(Interval) ->
+    begin_for_systems([quorum_queues], Interval).
+
+begin_coordination_chaos() ->
+    begin_coordination_chaos(?DEFAULT_INTERVAL).
+
+begin_coordination_chaos(Interval) ->
+    begin_for_systems([coordination], Interval).
+
+begin_delayed_chaos() ->
+    begin_delayed_chaos(?DEFAULT_INTERVAL).
+
+begin_delayed_chaos(Interval) ->
+    begin_for_systems([delayed_queues], Interval).
+
+begin_jms_chaos() ->
+    begin_jms_chaos(?DEFAULT_INTERVAL).
+
+begin_jms_chaos(Interval) ->
+    begin_for_systems([jms_queues], Interval).
 
 begin_chaos(Cfg) ->
     gen_server:call(?SERVER, {begin_chaos, Cfg}).
+
+stop() ->
+    gen_server:call(?SERVER, stop_chaos).
 
 -spec start_link() -> rabbit_types:ok_pid_or_error().
 start_link() ->
@@ -80,24 +110,34 @@ start_link() ->
 
 init([]) ->
     process_flag(trap_exit, true),
-    Cfg = #{interval => 20000,
+    Cfg = #{interval => ?DEFAULT_INTERVAL,
+            ra_systems => [],
             events => []},
-    {ok, #?MODULE{cfg = Cfg}}.
+    {ok, #?MODULE{cfg = Cfg, timer_ref = undefined}}.
 
-handle_call({begin_chaos, #{interval := Interval} = Cfg}, _From, State) ->
-    _ = erlang:send_after(Interval, self(), do_chaos),
+handle_call({begin_chaos, #{interval := Interval} = Cfg}, _From, State0) ->
+    State = cancel_timer(State0),
+    Ref = erlang:send_after(Interval, self(), do_chaos),
+    {reply, ok, State#?MODULE{cfg = Cfg, timer_ref = Ref}};
+handle_call(stop_chaos, _From, State0) ->
+    State = cancel_timer(State0),
+    Cfg = #{interval => ?DEFAULT_INTERVAL,
+            ra_systems => [],
+            events => []},
+    rabbit_log:info("~s: chaos stopped", [?MODULE]),
     {reply, ok, State#?MODULE{cfg = Cfg}}.
 
 handle_cast(_Request, State) ->
     {noreply, State}.
 
-handle_info(do_chaos, #?MODULE{cfg = #{ra_system := Sys,
+handle_info(do_chaos, #?MODULE{cfg = #{ra_systems := Systems,
                                        interval := Interval} = Cfg} = State) ->
     Events = maps:get(events, Cfg),
     {Name, _, Event} = pick_event(Events),
+    Sys = pick_random(Systems),
     do_event(Sys, Name, Event),
-    _ = erlang:send_after(Interval, self(), do_chaos),
-    {noreply, State};
+    Ref = erlang:send_after(Interval, self(), do_chaos),
+    {noreply, State#?MODULE{timer_ref = Ref}};
 handle_info(_, #?MODULE{} = State) ->
     {noreply, State}.
 
@@ -109,12 +149,54 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% internal
 
+begin_for_systems(Systems, Interval) ->
+    Events = lists:flatmap(fun events_for_system/1, Systems)
+             ++ common_events(),
+    begin_chaos(#{ra_systems => Systems,
+                  interval => Interval,
+                  events => Events}).
+
+events_for_system(quorum_queues) ->
+    [{kill_qq_wal, 1, {kill_named_proc, ra_log_wal, chaos}},
+     {kill_qq_seg_writer, 1, {kill_named_proc, ra_log_segment_writer, kill}},
+     {kill_qq_member, 2, {kill_ra_member, chaos}},
+     {restart_qq_member, 2, restart_ra_member}];
+events_for_system(coordination) ->
+    [{kill_coord_wal, 1, {kill_named_proc, ra_coordination_log_wal, chaos}},
+     {kill_coord_seg_writer, 1,
+      {kill_named_proc, ra_coordination_segment_writer, kill}},
+     {kill_coord_member, 2, {kill_ra_member, chaos}},
+     {restart_coord_member, 2, restart_ra_member}];
+events_for_system(delayed_queues) ->
+    [{kill_dq_wal, 1, {kill_named_proc, ra_delayed_queues_log_wal, chaos}},
+     {kill_dq_seg_writer, 1,
+      {kill_named_proc, ra_delayed_queues_segment_writer, kill}},
+     {kill_dq_member, 2, {kill_ra_member, chaos}},
+     {restart_dq_member, 2, restart_ra_member}];
+events_for_system(jms_queues) ->
+    [{kill_jms_wal, 1, {kill_named_proc, ra_jms_queues_log_wal, chaos}},
+     {kill_jms_seg_writer, 1,
+      {kill_named_proc, ra_jms_queues_segment_writer, kill}},
+     {kill_jms_member, 2, {kill_ra_member, chaos}},
+     {restart_jms_member, 2, restart_ra_member}].
+
+common_events() ->
+    [{flood_a_node, 2, flood_node}].
+
+cancel_timer(#?MODULE{timer_ref = undefined} = State) ->
+    State;
+cancel_timer(#?MODULE{timer_ref = Ref} = State) ->
+    _ = erlang:cancel_timer(Ref),
+    State#?MODULE{timer_ref = undefined}.
+
+pick_random(List) ->
+    lists:nth(rand:uniform(length(List)), List).
+
 do_event(_Sys, Name, {kill_named_proc, ProcName, ExitReason}) ->
     rabbit_log:info("~s: doing event ~s...", [?MODULE, Name]),
     catch exit(whereis(ProcName), ExitReason),
     ok;
 do_event(_Sys, Name, flood_node) ->
-    %% TODO: avoid if nodes() == []
     Nodes = nodes(),
     case Nodes of
         [] -> ok;
@@ -133,7 +215,6 @@ do_event(_Sys, Name, flood_node) ->
                                    Pid ! Data,
                                    rabbit_log:info("~s: flood of node ~s competed ~s...",
                                                    [?MODULE, Selected, Name]),
-                                   %% flood complete
                                    ok;
                                ok ->
                                    F(N-1)
@@ -143,26 +224,35 @@ do_event(_Sys, Name, flood_node) ->
             Loop(10000),
             ok
     end;
-do_event(_Sys, Name, {kill_ra_member, ExitReason}) ->
-    rabbit_log:info("~s: doing event ~s...", [?MODULE, Name]),
-    Procs = ets:tab2list(ra_leaderboard),
-    At = rand:uniform(length(Procs)),
-    {Selected, _, _} = lists:nth(At, Procs),
-    {ok, _, _} = ra:local_query({Selected, node()},
-                                fun (_) -> process_flag(trap_exit, false) end),
-    catch exit(whereis(Selected), ExitReason),
-    ok;
+do_event(Sys, Name, {kill_ra_member, ExitReason}) ->
+    rabbit_log:info("~s: doing event ~s in Ra system ~s...", [?MODULE, Name, Sys]),
+    case list_registered_safe(Sys) of
+        [] ->
+            rabbit_log:info("~s: no Ra members in system ~s, skipping", [?MODULE, Sys]),
+            ok;
+        Registered ->
+            {Selected, _UId} = pick_random(Registered),
+            {ok, _, _} = ra:local_query({Selected, node()},
+                                        fun (_) -> process_flag(trap_exit, false) end),
+            catch exit(whereis(Selected), ExitReason),
+            ok
+    end;
 do_event(Sys, Name, restart_ra_member = Type) ->
-    rabbit_log:info("~s: doing event ~s of type ~s", [?MODULE, Name, Type]),
-    Procs = ets:tab2list(ra_leaderboard),
-    At = rand:uniform(length(Procs)),
-    {ServerName, _, _} = lists:nth(At, Procs),
-    ServerId = {ServerName, node()},
-    _ = ra:stop_server(Sys, ServerId),
-    Sleep = rand:uniform(10000) + 1000,
-    timer:sleep(Sleep),
-    _ = ra:restart_server(Sys, ServerId),
-    ok;
+    rabbit_log:info("~s: doing event ~s of type ~s in Ra system ~s",
+                    [?MODULE, Name, Type, Sys]),
+    case list_registered_safe(Sys) of
+        [] ->
+            rabbit_log:info("~s: no Ra members in system ~s, skipping", [?MODULE, Sys]),
+            ok;
+        Registered ->
+            {ServerName, _UId} = pick_random(Registered),
+            ServerId = {ServerName, node()},
+            _ = ra:stop_server(Sys, ServerId),
+            Sleep = rand:uniform(10000) + 1000,
+            timer:sleep(Sleep),
+            _ = ra:restart_server(Sys, ServerId),
+            ok
+    end;
 do_event(Sys, Name, {multi, Num, Interval, Event}) ->
     rabbit_log:info("~s: doing multi event ~s...",
                     [?MODULE, Name]),
@@ -171,6 +261,13 @@ do_event(Sys, Name, {multi, Num, Interval, Event}) ->
                timer:sleep(Interval)
            end || _ <- lists:seq(1, Num)],
     ok.
+
+list_registered_safe(Sys) ->
+    try
+        ra_directory:list_registered(Sys)
+    catch
+        _:_ -> []
+    end.
 
 pick_event(Events) ->
     TotalWeight = lists:sum([element(2, E) || E <- Events]),
