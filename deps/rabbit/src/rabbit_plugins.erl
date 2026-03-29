@@ -453,19 +453,30 @@ find_unzipped_app_file(ExpandDir, Files) ->
     ].
 
 prepare_plugin(#plugin{type = ez, name = Name, location = Location}, ExpandDir) ->
-    case zip:unzip(Location, [{cwd, ExpandDir}]) of
-        {ok, Files} ->
-            case find_unzipped_app_file(ExpandDir, Files) of
-                [PluginAppDescPath|_] ->
-                    prepare_dir_plugin(PluginAppDescPath);
-                _ ->
-                    rabbit_log:error("Plugin archive '~s' doesn't contain an .app file", [Location]),
-                    throw({app_file_missing, Name, Location})
-            end;
-        {error, Reason} ->
-            rabbit_log:error("Could not unzip plugin archive '~s': ~p", [Location, Reason]),
-            throw({failed_to_unzip_plugin, Name, Location, Reason})
-    end;
+  case zip:unzip(Location, [{cwd, ExpandDir}]) of
+    {ok, Files} ->
+      %% CVE-2025-4748: Validate all extracted paths stay within ExpandDir
+      case validate_extracted_paths(Files, ExpandDir) of
+        ok ->
+          ok;
+        {error, BadFile} ->
+          rabbit_log:error("Plugin archive '~s' contains path traversal: ~s",
+            [Location, BadFile]),
+          _ = delete_recursively(ExpandDir),
+          throw({path_traversal_in_plugin, Name, Location, BadFile})
+      end,
+      case find_unzipped_app_file(ExpandDir, Files) of
+        [PluginAppDescPath|_] ->
+          prepare_dir_plugin(PluginAppDescPath);
+        _ ->
+          rabbit_log:error("Plugin archive '~s' doesn't contain an .app file", [Location]),
+          throw({app_file_missing, Name, Location})
+      end;
+    {error, Reason} ->
+      rabbit_log:error("Could not unzip plugin archive '~s': ~p", [Location, Reason]),
+      throw({failed_to_unzip_plugin, Name, Location, Reason})
+  end;
+
 prepare_plugin(#plugin{type = dir, location = Location, name = Name},
                _ExpandDir) ->
     case filelib:wildcard(Location ++ "/ebin/*.app") of
@@ -697,3 +708,76 @@ maybe_report_plugin_loading_problems(Problems) ->
     io:format(standard_error,
               "Problem reading some plugins: ~p~n",
               [Problems]).
+
+%% ---------------------------------------------------------------------------
+%% CVE-2025-4748: Validate that all extracted file paths stay within BaseDir.
+%% Prevents path traversal attacks via malicious plugin archives containing
+%% absolute paths or "../" sequences.
+%% ---------------------------------------------------------------------------
+validate_extracted_paths([], _BaseDir) ->
+  ok;
+validate_extracted_paths([File | Rest], BaseDir) ->
+  case is_path_within(File, BaseDir) of
+    true  -> validate_extracted_paths(Rest, BaseDir);
+    false -> {error, File}
+  end.
+
+%% Check if FilePath is within BaseDir after resolving all ".." and symlinks.
+%% Uses normalized absolute paths for comparison.
+%%
+%% Examples:
+%%   is_path_within("/opt/rabbitmq/plugins/my_plugin/ebin/mod.beam",
+%%                  "/opt/rabbitmq/plugins") -> true
+%%
+%%   is_path_within("/etc/passwd",
+%%                  "/opt/rabbitmq/plugins") -> false
+%%
+%%   is_path_within("/opt/rabbitmq/plugins/../../../etc/passwd",
+%%                  "/opt/rabbitmq/plugins") -> false
+%%
+is_path_within(FilePath, BaseDir) ->
+  NormalizedFile = normalize_path(FilePath),
+  NormalizedBase = normalize_path(BaseDir),
+  %% Ensure BaseDir ends with "/" for prefix matching,
+  %% so "/opt/rabbit" doesn't match "/opt/rabbit_other/..."
+  BaseDirSlash = case lists:last(NormalizedBase) of
+                   $/ -> NormalizedBase;
+                   _  -> NormalizedBase ++ "/"
+                 end,
+  lists:prefix(BaseDirSlash, NormalizedFile).
+
+%% Normalize a path by:
+%% 1. Converting to absolute path
+%% 2. Splitting into components
+%% 3. Resolving all ".." by removing parent entries
+%% 4. Rejoining
+%%
+%% Example: "/opt/rabbitmq/plugins/../../../etc" -> "/etc"
+%%
+normalize_path(Path) ->
+  AbsPath = filename:absname(Path),
+  Components = filename:split(AbsPath),
+  Resolved = resolve_dotdot(Components, []),
+  filename:join(Resolved).
+
+%% Resolve ".." path components by popping parent directories.
+%%
+%% ["/" , "opt", "rabbit", "..", "..", "etc"]
+%%   -> process "opt"    : Stack = ["/", "opt"]
+%%   -> process "rabbit" : Stack = ["/", "opt", "rabbit"]
+%%   -> process ".."     : Stack = ["/", "opt"]           (pop "rabbit")
+%%   -> process ".."     : Stack = ["/"]                  (pop "opt")
+%%   -> process "etc"    : Stack = ["/", "etc"]
+%%   -> Result: "/etc"
+%%
+resolve_dotdot([], Acc) ->
+  lists:reverse(Acc);
+resolve_dotdot([".." | Rest], [_Parent | Acc]) when Acc =/= [] ->
+  resolve_dotdot(Rest, Acc);
+resolve_dotdot([".." | Rest], Acc) ->
+  %% Already at root, can't go higher - just skip
+  resolve_dotdot(Rest, Acc);
+resolve_dotdot(["." | Rest], Acc) ->
+  resolve_dotdot(Rest, Acc);
+resolve_dotdot([Component | Rest], Acc) ->
+  resolve_dotdot(Rest, [Component | Acc]).
