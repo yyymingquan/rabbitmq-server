@@ -26,11 +26,14 @@ variances(Req, Context) ->
 allowed_methods(ReqData, Context) ->
     {[<<"POST">>, <<"OPTIONS">>], ReqData, Context}.
 
-resource_exists(ReqData, Context) ->
-    {case rabbit_mgmt_wm_queue:queue(ReqData) of
-         not_found -> false;
-         _         -> true
-     end, ReqData, Context}.
+resource_exists(ReqData0, Context) ->
+  case rabbit_mgmt_wm_queue:queue(ReqData0) of
+    not_found ->
+      ReqData1 = rabbit_mgmt_util:set_resp_not_found(<<"queue_not_found">>, ReqData0),
+      {false, ReqData1, Context};
+    _ ->
+      {true, ReqData0, Context}
+  end.
 
 content_types_accepted(ReqData, Context) ->
    {[{'*', accept_content}], ReqData, Context}.

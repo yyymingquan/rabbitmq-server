@@ -29,11 +29,14 @@ allowed_methods(ReqData, Context) ->
 content_types_provided(ReqData, Context) ->
    {rabbit_mgmt_util:responder_map(to_json), ReqData, Context}.
 
-resource_exists(ReqData, Context) ->
-    {case rabbit_mgmt_wm_exchange:exchange(ReqData) of
-         not_found -> false;
-         _         -> true
-     end, ReqData, Context}.
+resource_exists(ReqData0, Context) ->
+  case rabbit_mgmt_wm_exchange:exchange(ReqData0) of
+    not_found ->
+      ReqData1 = rabbit_mgmt_util:set_resp_not_found(<<"exchange_not_found">>, ReqData0),
+      {false, ReqData1, Context};
+    _ ->
+      {true, ReqData0, Context}
+  end.
 
 content_types_accepted(ReqData, Context) ->
    {[{'*', accept_content}], ReqData, Context}.
